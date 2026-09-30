@@ -471,9 +471,9 @@ install_hysteria() {
       die "服务启动失败。"
     fi
   fi
-  if ! systemctl is-active --quiet "${SERVICE}"; then
+  if ! wait_for_service_stable; then
     journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
-    die "服务启动失败。"
+    die "服务启动后未稳定运行。"
   fi
   print_connection_info
 }
@@ -493,11 +493,11 @@ update_hysteria() {
       journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
       die "更新后服务重启失败。"
     fi
-    if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
+    if wait_for_service_stable; then
       info "更新完成。"
     else
       journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
-      die "更新后服务未运行。"
+      die "更新后服务未稳定运行。"
     fi
   else
     info "更新完成；服务更新前处于停止状态，未自动启动。"
@@ -556,6 +556,16 @@ uninstall_hysteria() {
 service_action() {
   require_root
   systemctl "$ACTION" "${SERVICE}"
+}
+
+wait_for_service_stable() {
+  local attempt
+  for ((attempt = 1; attempt <= 15; attempt++)); do
+    if ! systemctl is-active --quiet "${SERVICE}"; then
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 main() {
