@@ -19,11 +19,13 @@
 
 | 使用强度 | 机型 | CPU / 内存 | 磁盘 |
 |---|---|---:|---:|
-| 1-5 人 | `e2-medium` | 1 个共享 vCPU / 4 GB | 20-30 GB `pd-balanced` |
+| 1-5 人 | `e2-medium` | 2 个共享 vCPU，合计持续配额约 1 核 / 4 GB | 20-30 GB `pd-balanced` |
 | 5-15 人，普通网页和视频 | `e2-standard-2` | 2 vCPU / 8 GB | 30 GB `pd-balanced` |
 | 10-15 人，经常同时 4K 或下载 | `e2-standard-4` | 4 vCPU / 16 GB | 30-50 GB `pd-balanced` |
 
 ## 一键安装
+
+Google Web SSH 通常以普通用户登录，请先执行 `sudo -i` 进入 root shell。下列安装和管理命令均在 root shell 中运行。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
@@ -40,15 +42,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 - 使用 Hysteria 自己的 `bbr` 拥塞控制器。
 - 安装 `qrencode`，在 Web SSH 终端显示可扫描二维码，并保存 PNG 和受保护的 URI 文本。
 
+为保证 TLS-ALPN 证书验证成功，当前安装器只接受端口 `443`；传入其他端口会直接拒绝。
+
 脚本不会安装 Nginx、Docker、面板、BBR 内核调优、定时任务或第三方伪装代理，也不会修改 Google Cloud VPC 防火墙。
 
 ## 安装前必须准备
 
 1. 准备一个直接解析到 VM 公网 IP 的域名。不要把域名放在 Cloudflare 橙云代理后面。
 2. 在 Google Cloud VPC 防火墙放行 **TCP 443 和 UDP 443**。TCP 443 用于 ACME TLS-ALPN 证书申请和续期，UDP 443 用于 Hysteria 流量。
-3. 确认 VM 使用 Debian 12/13、Ubuntu LTS 或 Rocky 等带 systemd 的常见 Linux 发行版。Debian/Ubuntu 上脚本会自动执行 `apt-get update` 并安装 `curl`、`openssl`、`qrencode`、`iproute2` 和证书包；不会安装 Nginx。
+3. 推荐使用带 systemd 的 Debian 12/13 或 Ubuntu LTS 官方镜像。脚本使用系统自带的 `apt-get` 安装缺失依赖；入口命令本身需要 `curl`，若提示找不到它，先运行 `apt-get update && apt-get install -y curl ca-certificates`。Rocky 等 RPM 系发行版仅提供依赖安装分支，需自行确认仓库有 `qrencode`（可能需要 EPEL），并放行系统防火墙。
 
-进入 Google Web SSH 后只需要输入域名；脚本会自动生成随机密码并在完成时显示。脚本不要求重启 VM；如果系统镜像或管理员策略要求重启，脚本会在检查阶段直接报告，而不会擅自重启。
+进入 root shell 并运行命令后，全新安装只需输入域名；脚本会自动生成随机密码。脚本不会重启 VM，也不会自动修改系统或云端防火墙。
 
 ## 运行方式
 
@@ -65,7 +69,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --email com.gpugame@gmail.com
 ```
 
-安装成功后，脚本会同时输出：
+服务启动后，脚本会同时输出（仍需客户端验证公网连通性）：
 
 - Shadowrocket 可用的 `hysteria2://` URI；
 - 终端 Unicode 二维码，适合直接在 Google Web SSH 页面放大后扫码；
@@ -85,18 +89,23 @@ printf '%s\n' 'your-safe-password' | \
 其他操作：
 
 ```bash
-install.sh update
-install.sh status
-install.sh restart
-install.sh uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) update
+systemctl status hysteria-server.service
+systemctl restart hysteria-server.service
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) uninstall
 ```
 
-更新会保留现有配置。安装时发现已有配置，会先备份到 `/var/backups/hysteria2-installer/`，然后要求确认是否覆盖；使用 `--yes` 可跳过确认。
+更新前会备份现有配置。重装已有配置时会要求确认是否覆盖，并备份到 `/var/backups/hysteria2-installer/`；使用 `--yes` 可跳过确认。
+
+卸载只清理状态记录明确归本安装器创建的用户和数据目录；已有或归属不明的目录会保留。不要在本安装器创建的 `/var/lib/hysteria` 中存放其他文件。配置备份和 `/root/hysteria2-域名.{txt,png}` 会保留供恢复使用，其中含有凭据，需要时请自行删除。
+
+如果检测到已有且归属不明的伪装页面，安装器会拒绝覆盖；请使用 `--no-masquerade`，或先手工备份并移除该页面。
 
 如果不需要静态伪装页面，可以使用：
 
 ```bash
-install.sh install --domain hy2.example.com --no-masquerade
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
+  install --domain hy2.example.com --no-masquerade
 ```
 
 ## 关于 Nginx 和 BBR
@@ -105,18 +114,25 @@ install.sh install --domain hy2.example.com --no-masquerade
 
 这里没有默认修改 Linux TCP BBR 的 sysctl。Hysteria 2 使用 QUIC，配置中的 `congestion.type: bbr` 是 Hysteria 自己的拥塞控制器，与 Linux TCP BBR 是两回事。额外安装或修改 TCP BBR 不保证提升 Hysteria 或 YouTube 速度，也会增加系统改动，因此保持关闭。
 
+客户端未填写带宽提示时使用 BBR；若 Shadowrocket 配置了上传或下载带宽，对应方向可能改用 Brutal。因此这里的配置并不强制所有客户端始终使用 BBR。
+
 实际速度更受 VM 所在地区、到客户端的线路、UDP 丢包和 Google Cloud 防火墙影响。
 
-Google Cloud VPC 防火墙属于 VM 外部的云资源，普通 VM 内的 Bash 脚本不能可靠地替你修改它；因此这是创建 VM 时唯一需要在控制台或 `gcloud` 中预先完成的步骤。TCP/UDP 端口规则必须分别放行。
+Google Cloud VPC 防火墙属于 VM 外部的云资源，需在控制台或 `gcloud` 中预先放行 TCP/UDP 443；运行脚本前也必须完成域名解析。不能仅勾选“允许 HTTPS 流量”而遗漏 UDP 443。
 
 ## 安全与可审计性
 
 - 所有安装器行为写在 `install.sh` 中；官方 Hysteria 安装器地址也在文件顶部明确列出。
 - 下载官方安装器时强制使用 HTTPS；官方安装器随后从 Hysteria 官方 GitHub Release 下载程序。
+- 官方安装器地址是动态脚本，未在本项目中固定 SHA256；对供应链可复现性要求较高时，应先按下面的命令审阅下载内容。
+- 下载失败、空文件或 Bash 语法检查失败时会拒绝执行官方安装器；这些检查不能代替签名或可信哈希验证。`--version` 也不会固定官方安装器脚本内容。
+- 一键命令使用 GitHub `main` 分支，生产环境可将 URL 中的 `main` 替换为你审阅过的固定 commit。
 - 不使用固定密码、虚假默认邮箱或外部 Bing 代理。
 - 配置文件写入权限为 `root:hysteria`、`0640`；密码只在安装完成时显示。
 - 脚本不会自动读取或上传 GCP 凭据、域名密码或 Hysteria 配置。
 - 官方安装器会查询版本 API，并发送系统类型和 CPU 架构用于选择版本；这是更新检查，不是流量统计。
+
+验证范围：本地 Bash 语法、参数校验、配置生成及部分模拟故障路径。尚未在真实 GCP VM 和域名上完成 ACME 签发、Shadowrocket 扫码及公网端到端测试；`systemctl is-active` 不能单独证明这些步骤成功。连接失败时先检查 `journalctl -u hysteria-server.service -n 100 --no-pager`，再检查 DNS、云端/系统防火墙及客户端 UDP 连通性。
 
 安装前如需审阅脚本：
 

@@ -17,11 +17,13 @@ If 10–15 users will frequently stream 4K video or download large files at the 
 
 | Workload | Machine type | CPU / RAM | Disk |
 |---|---|---:|---:|
-| 1–5 users | `e2-medium` | 1 shared vCPU / 4 GB | 20–30 GB `pd-balanced` |
+| 1–5 users | `e2-medium` | 2 shared vCPUs, about 1 core sustained aggregate quota / 4 GB | 20–30 GB `pd-balanced` |
 | 5–15 users, normal web and video | `e2-standard-2` | 2 vCPUs / 8 GB | 30 GB `pd-balanced` |
 | 10–15 users, frequent 4K or downloads | `e2-standard-4` | 4 vCPUs / 16 GB | 30–50 GB `pd-balanced` |
 
 ## One-click installation
+
+Google Web SSH normally signs in as a regular user. Run `sudo -i` first to enter a root shell. Run the installation and management commands below in that root shell.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
@@ -38,15 +40,17 @@ The installer will:
 - enable Hysteria’s own `bbr` congestion controller;
 - install `qrencode`, print a scannable terminal QR code in Google Web SSH, and save a PNG and protected URI text file.
 
+To keep TLS-ALPN certificate validation working, this installer accepts only port `443` and rejects other values.
+
 It does not install Nginx, Docker, panels, Linux TCP BBR sysctl tuning, cron jobs, or third-party masquerade proxies. It does not modify Google Cloud VPC firewall rules.
 
 ## Required preparation
 
 1. Point a domain directly to the VM’s public IP. Do not put it behind Cloudflare’s orange-cloud proxy.
 2. Allow **TCP 443 and UDP 443** in the Google Cloud VPC firewall. TCP 443 is required for ACME TLS-ALPN validation and renewal; UDP 443 carries Hysteria traffic.
-3. Use Debian 12/13, Ubuntu LTS, Rocky, or another standard systemd-based image. On Debian and Ubuntu, the installer runs `apt-get update` and installs missing `curl`, `openssl`, `qrencode`, `iproute2`, and CA certificates. It does not install Nginx.
+3. Use an official Debian 12/13 or Ubuntu LTS image with systemd. The installer uses the existing `apt-get` to install missing dependencies. The entry command itself requires `curl`; if missing, first run `apt-get update && apt-get install -y curl ca-certificates`. RPM distributions such as Rocky have a dependency-installation branch only: ensure `qrencode` is available (EPEL might be required), and configure the OS firewall yourself.
 
-After opening Google Web SSH, enter only the domain. The password is generated automatically. A VM reboot is normally unnecessary; the installer never reboots the VM by itself.
+After entering a root shell and running the command, a fresh installation asks only for the domain and generates the password automatically. The installer does not reboot the VM or modify OS or cloud firewall rules.
 
 ## Usage
 
@@ -63,7 +67,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --email com.gpugame@gmail.com
 ```
 
-On success, the script prints:
+After the service starts, the script prints the following (public connectivity still needs a client test):
 
 - a `hysteria2://` URI for Shadowrocket;
 - a Unicode QR code for scanning from the Google Web SSH page;
@@ -83,18 +87,23 @@ printf '%s\n' 'your-safe-password' | \
 Other operations:
 
 ```bash
-install.sh update
-install.sh status
-install.sh restart
-install.sh uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) update
+systemctl status hysteria-server.service
+systemctl restart hysteria-server.service
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) uninstall
 ```
 
-Updates keep the existing configuration. If an installation finds an existing configuration, it creates a backup under `/var/backups/hysteria2-installer/` before asking to overwrite it. Use `--yes` to skip that prompt.
+Updates back up the current configuration first. Reinstalling over an existing configuration asks for confirmation and saves a backup under `/var/backups/hysteria2-installer/`. Use `--yes` to skip that prompt.
+
+Uninstall only removes users and data directories explicitly recorded as created by this installer. Pre-existing directories and those with unknown ownership history are preserved. Do not store unrelated files in an installer-created `/var/lib/hysteria`. Configuration backups and `/root/hysteria2-domain.{txt,png}` remain for recovery; they contain credentials and can be removed manually when no longer needed.
+
+If an existing masquerade page has unknown ownership, the installer refuses to overwrite it. Use `--no-masquerade`, or back up and remove the page manually first.
 
 To omit the static masquerade page:
 
 ```bash
-install.sh install --domain hy2.example.com --no-masquerade
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
+  install --domain hy2.example.com --no-masquerade
 ```
 
 ## Nginx and BBR
@@ -102,6 +111,8 @@ install.sh install --domain hy2.example.com --no-masquerade
 Nginx is unnecessary. Hysteria 2 handles ACME, TLS, HTTP/3 masquerading, and the static page itself; installing Nginx could also take over port 443.
 
 The installer does not change Linux TCP BBR sysctl settings. Hysteria 2 uses QUIC, and `congestion.type: bbr` is Hysteria’s own congestion controller. Extra TCP BBR tuning does not guarantee faster Hysteria or YouTube traffic and adds system changes.
+
+BBR is used when the client omits bandwidth hints. Configuring upload or download bandwidth in Shadowrocket can select Brutal for that direction, so the server setting does not force every client to use BBR at all times.
 
 Actual speed depends more on the VM region, the route to clients, UDP packet loss, and Google Cloud firewall rules.
 
@@ -111,10 +122,15 @@ Google Cloud VPC firewall rules are external cloud resources. A normal VM-side B
 
 - All installer behavior is in `install.sh`; the official Hysteria installer URL is explicit at the top of the file.
 - The official installer is downloaded over HTTPS and then downloads the Hysteria binary from official GitHub Releases.
+- The official installer endpoint is a dynamic script and is not pinned to a SHA256 in this repository. Review the downloaded script before use when reproducibility is critical.
+- Failed downloads, empty files, and Bash syntax errors prevent execution of the official installer. These checks do not replace signature or trusted-hash verification. `--version` does not pin the official installer script.
+- The one-click command uses GitHub’s mutable `main` branch. For production, replace `main` with a commit that you have reviewed.
 - No fixed password, fake default email, or external Bing masquerade proxy is used.
 - The configuration is written as `root:hysteria` with mode `0640`; the generated URI text file is mode `0600`.
 - The script does not read or upload GCP credentials, domain credentials, or the Hysteria configuration.
 - The official installer checks a version API and sends OS and CPU architecture information to select a release; it does not collect proxy traffic.
+
+Validation scope: local Bash syntax, argument validation, configuration generation, and selected simulated failure paths. Real GCP/ACME issuance, Shadowrocket QR import, and public end-to-end connectivity have not been tested. `systemctl is-active` alone does not prove these work. Check `journalctl -u hysteria-server.service -n 100 --no-pager`, DNS, both cloud and OS firewalls, and client UDP connectivity if a connection fails.
 
 Review the installer before running it:
 
