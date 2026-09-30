@@ -138,7 +138,7 @@ Google Cloud VPC 防火墙属于 VM 外部的云资源，需在控制台或 `gcl
 - 脚本不会自动读取或上传 GCP 凭据、域名密码或 Hysteria 配置。
 - 官方安装器会查询版本 API，并发送系统类型和 CPU 架构用于选择版本；这是更新检查，不是流量统计。
 
-验证范围：已通过 `bash -n install.sh`、`bash install.sh --help`、自动密码校验，以及 `tests/test_startup.sh` 中的启动状态、进程归属、证书错误分类和恢复路径模拟测试。尚未在真实 GCP VM 和域名上完成 ACME 签发、Shadowrocket 扫码及公网端到端测试；`systemctl is-active` 不能单独证明这些步骤成功。连接失败时先检查 `journalctl -u hysteria-server.service -n 100 --no-pager`，再检查 DNS、云端/系统防火墙及客户端 UDP 连通性。
+验证范围：已通过 `bash -n install.sh`、`bash install.sh --help`、自动密码校验，以及 `test_startup.sh` 中的启动状态、进程归属、证书错误分类和恢复路径模拟测试。尚未在真实 GCP VM 和域名上完成 ACME 签发、Shadowrocket 扫码及公网端到端测试；`systemctl is-active` 不能单独证明这些步骤成功。连接失败时先检查 `journalctl -u hysteria-server.service -n 100 --no-pager`，再检查 DNS、云端/系统防火墙及客户端 UDP 连通性。
 
 安装前如需审阅脚本：
 

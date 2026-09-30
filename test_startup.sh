@@ -2,7 +2,12 @@
 
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/install.sh" ]]; then
+  ROOT_DIR="${SCRIPT_DIR}"
+else
+  ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 INSTALLER="${ROOT_DIR}/install.sh"
 
 pass() { printf 'PASS: %s\n' "$*"; }
@@ -17,7 +22,7 @@ assert_true() {
 
 # Load the installer functions without invoking its command-line entrypoint.
 # All systemd, journalctl and ss interactions below are deterministic mocks.
-eval "$(sed '/^main \"\$@\"/d' "${INSTALLER}")"
+source <(sed '/^main \"\$@\"/d' "${INSTALLER}")
 
 TEST_TMP="$(mktemp -d)"
 SS_CALLS_FILE="${TEST_TMP}/ss-calls"
