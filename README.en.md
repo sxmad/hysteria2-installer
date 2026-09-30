@@ -74,9 +74,11 @@ After the service starts, the script prints the following (public connectivity s
 - `/root/hysteria2-domain.png`, the QR image;
 - `/root/hysteria2-domain.txt`, the connection information with mode `600`.
 
-The installer does not declare success from `systemctl is-active` alone. It waits for ACME certificate processing to finish, confirms that the local UDP 443 listener is present, and checks the current service invocation for certificate or configuration errors. If TCP 443 is blocked, DNS is wrong, certificate issuance fails, UDP 443 is not listening, or the service exits repeatedly, installation ends with an error and prints recent logs plus troubleshooting guidance; it does not print a usable URI or QR code. Cloud firewall reachability cannot be reliably tested from inside the VM, so create the TCP 443 and UDP 443 rules in Google Cloud first.
+The installer does not declare success from `systemctl is-active` alone. It waits for ACME certificate processing to finish, confirms that the local UDP 443 listener is present, and checks the current service invocation for certificate or configuration errors. It prints a URI or QR code only after the certificate succeeds, the service is stable, and the local UDP 443 listener is present.
 
-The first certificate request can wait for up to about 120 seconds; do not start multiple installer processes during that wait.
+For a transient ACME error such as a CA server error, bad nonce, or connection reset, the installer prints the cause and offers `1` to repair and restart, or `2` to abort; it allows at most three repair retries. A TCP 443 timeout/refusal, firewall or DNS/CAA problem, certificate rate limit, port conflict, configuration error, or missing UDP 443 listener cannot be reliably repaired by the installer, so it explains the issue and stops. Cloud UDP firewall reachability cannot be reliably tested from inside the VM, so create both the TCP 443 and UDP 443 rules in Google Cloud first.
+
+Each first certificate attempt can wait for up to about 120 seconds; do not start multiple installer processes during that wait. At the start of a reinstall, same-domain QR and URI files are moved to `/var/backups/hysteria2-installer/` so a failed run cannot leave an old credential looking usable.
 
 The QR code contains the connection URI and therefore the password. Keep the terminal screenshot and PNG private.
 

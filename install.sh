@@ -28,6 +28,8 @@ NO_MASQUERADE=0
 YES=0
 VERSION=""
 QR_FILE=""
+LAST_SERVICE_INVOCATION_ID=""
+SERVICE_STARTED_AT=""
 
 die() {
   printf '%s: %s\n' "${SCRIPT_NAME}" "$*" >&2
@@ -384,7 +386,8 @@ print_connection_info() {
   chmod 0600 "/root/hysteria2-${DOMAIN}.txt"
 
   info ""
-  info "安装完成。"
+  info "服务器安装与本机启动检查通过。"
+  warn "公网 UDP 入站及客户端连通性尚未验证，请在 Shadowrocket 中实际连接确认。"
   info "域名: ${DOMAIN}"
   info "端口: ${PORT}（UDP；证书续期还需要 TCP ${PORT}）"
   info "密码: ${PASSWORD}"
@@ -406,12 +409,16 @@ print_connection_info() {
     warn "未找到 qrencode，无法显示二维码；URI 已保存到 /root/hysteria2-${DOMAIN}.txt。"
   fi
   info ""
-  info "Google Cloud 防火墙请放行 TCP ${PORT} 和 UDP ${PORT}。"
+  info "请保持 Google Cloud 防火墙放行 TCP ${PORT} 和 UDP ${PORT}。"
 }
 
 service_port_is_listening() {
-  command -v ss >/dev/null 2>&1 || return 1
-  ss -H -lun 2>/dev/null | awk -v port=":${PORT}" '$4 ~ (port "$") || $5 ~ (port "$") { found=1 } END { exit !found }'
+  local service_pid
+  service_pid="$(systemctl show -p MainPID --value "${SERVICE}" 2>/dev/null)" || return 1
+  [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  # Verify the socket belongs to this service, not an unrelated UDP listener.
+  ss -H -lunp 2>/dev/null | awk -v port=":${PORT}" -v owner="pid=${service_pid}," \
+    '($4 ~ (port "$") || $5 ~ (port "$")) && index($0, owner) { found=1 } END { exit !found }'
 }
 
 service_invocation_logs() {
@@ -420,8 +427,134 @@ service_invocation_logs() {
     journalctl -u "${SERVICE}" _SYSTEMD_INVOCATION_ID="${invocation_id}" \
       --no-pager -n 100 2>/dev/null || true
   else
-    journalctl -u "${SERVICE}" --since "-3 minutes" --no-pager -n 100 2>/dev/null || true
+    [[ -n "${SERVICE_STARTED_AT}" ]] || return 0
+    journalctl -u "${SERVICE}" --since "${SERVICE_STARTED_AT}" --no-pager -n 100 2>/dev/null || true
   fi
+}
+
+service_logs_match() {
+  local invocation_id="$1"
+  local pattern="$2"
+  service_invocation_logs "${invocation_id}" | grep -Ei -- "${pattern}" >/dev/null
+}
+
+service_failure_kind() {
+  local invocation_id="$1"
+  # Match actual failures, not INFO messages such as certificate maintenance
+  # or waiting on the ACME internal rate limiter. The generic config wrapper
+  # must come after the underlying ACME cause.
+  if service_logs_match "${invocation_id}" \
+    'yaml:|yaml (parse|syntax|unmarshal)|unknown field|permission denied|address already in use|bind:|cannot bind'; then
+    printf '%s' hard
+  elif service_logs_match "${invocation_id}" \
+    'timeout during connect|likely firewall|connection refused|no valid (a|aaaa) records|no such host|temporary failure in name resolution|network is unreachable|network unreachable|no route to host|nxdomain|servfail|dns[^[:alnum:]]*(problem|error)|(^|[^[:alnum:]])caa([^[:alnum:]]|$)|rate.?limited|too many (requests|certificates|failed|new)|retry[- ]after|rejectedidentifier|unauthorized'; then
+    printf '%s' hard
+  elif service_logs_match "${invocation_id}" \
+    'challenge failed|authorization failed|could not get certificate|bad.?nonce|server.?internal|service.?unavailable|connection reset|i/o timeout|context deadline exceeded|http (500|502|503|504)|urn:ietf:params:acme:error:'; then
+    printf '%s' acme
+  elif service_logs_match "${invocation_id}" 'failed to load server config|invalid config'; then
+    printf '%s' hard
+  else
+    printf '%s' other
+  fi
+}
+
+explain_service_failure() {
+  local invocation_id="$1"
+  if service_logs_match "${invocation_id}" 'address already in use|bind:|cannot bind'; then
+    warn "端口绑定失败：请用 ss -lntup 检查 TCP/UDP 443 占用者；脚本不会停止其他服务。"
+  elif service_logs_match "${invocation_id}" 'permission denied'; then
+    warn "服务权限不足：请按日志中的路径检查 hysteria 用户读取配置、写入证书目录及绑定端口的权限。"
+  elif service_logs_match "${invocation_id}" 'rate.?limited|too many (requests|certificates|failed|new)|retry[- ]after'; then
+    warn "证书机构要求等待：请遵守日志中的 retry after/Retry-After 时间；重装或删除证书缓存不能解除限额。"
+  elif service_logs_match "${invocation_id}" 'timeout during connect|likely firewall|connection refused'; then
+    warn "证书验证连接失败：请确认域名指向本机，并在 Google Cloud 和系统防火墙放行入站 TCP 443；同时放行客户端所需 UDP 443，确保规则目标包含此 VM。"
+  elif service_logs_match "${invocation_id}" 'nxdomain|servfail|dns[^[:alnum:]]*(problem|error)|no valid (a|aaaa) records|no such host|name resolution|(^|[^[:alnum:]])caa([^[:alnum:]]|$)|rejectedidentifier|unauthorized'; then
+    warn "域名验证失败：检查 A/AAAA 是否指向此 VM、CAA 是否允许 letsencrypt.org，关闭域名代理；更正后再运行安装。"
+  elif service_logs_match "${invocation_id}" 'network is unreachable|network unreachable|no route to host'; then
+    warn "网络路由不可达：检查 VM 的公网出口、路由和出站防火墙。"
+  elif [[ "$(service_failure_kind "${invocation_id}")" == acme ]]; then
+    warn "证书申请遇到可能暂时的错误；可重启服务重试，并保留现有证书和 ACME 账户缓存。"
+  elif service_logs_match "${invocation_id}" 'invalid config|failed to load server config|yaml:|unknown field'; then
+    warn "配置加载失败：请根据上方日志修正配置；脚本不会盲目反复申请证书。"
+  else
+    warn "服务未就绪或缺少本服务的 UDP ${PORT} 监听；无法确认可用，停止安装。"
+  fi
+}
+
+prompt_certificate_repair() {
+  local attempt="$1"
+  local answer="" input_fd
+  if [[ -t 0 ]]; then
+    exec {input_fd}<&0
+  elif ! { exec {input_fd}</dev/tty; } 2>/dev/null; then
+    warn "没有可交互的终端，无法选择修复；安装已中断。"
+    return 1
+  fi
+  while :; do
+    printf '请选择：1. 修复并重试（第 %s/3 次）  2. 中断: ' "${attempt}" >&2
+    if ! read -r -u "${input_fd}" answer; then
+      exec {input_fd}<&-
+      return 1
+    fi
+    case "${answer}" in
+      1) exec {input_fd}<&-; return 0 ;;
+      2) exec {input_fd}<&-; return 1 ;;
+      *) warn "请输入 1 或 2。" ;;
+    esac
+  done
+}
+
+wait_for_service_with_recovery() {
+  local repair_attempts=0
+  local failure_kind=""
+  local invocation_id=""
+
+  while :; do
+    LAST_SERVICE_INVOCATION_ID=""
+    if wait_for_service_stable; then
+      return 0
+    fi
+
+    invocation_id="${LAST_SERVICE_INVOCATION_ID}"
+    [[ -n "${invocation_id}" ]] || invocation_id="$(service_current_invocation)"
+    failure_kind="$(service_failure_kind "${invocation_id}")"
+    show_service_diagnostics "${invocation_id}"
+    # Stop pending ACME work before asking the user or exiting.
+    if ! systemctl stop "${SERVICE}"; then
+      warn "无法停止失败的服务；请先手动检查 systemctl status ${SERVICE}。"
+      return 1
+    fi
+
+    case "${failure_kind}" in
+      hard)
+        warn "该问题无法通过重试可靠修复；安装已中断。"
+        return 1
+        ;;
+      acme)
+        if ((repair_attempts >= 3)); then
+          warn "证书自动修复已达到 3 次上限；安装已中断。"
+          return 1
+        fi
+        if ! prompt_certificate_repair "$((repair_attempts + 1))"; then
+          warn "已选择中断，未生成可用的连接二维码。"
+          return 1
+        fi
+        ((repair_attempts += 1))
+        info "$((repair_attempts * 5)) 秒后重启服务并重试证书申请（第 ${repair_attempts}/3 次）..."
+        sleep "$((repair_attempts * 5))"
+        SERVICE_STARTED_AT="$(date --iso-8601=seconds)"
+        systemctl reset-failed "${SERVICE}" >/dev/null 2>&1 || true
+        if ! systemctl restart "${SERVICE}"; then
+          warn "服务重启请求失败，将继续读取日志判断是否还能修复。"
+        fi
+        ;;
+      *)
+        warn "未识别的服务启动失败；为避免输出可能不可用的凭据，安装已中断。"
+        return 1
+        ;;
+    esac
+  done
 }
 
 service_current_invocation() {
@@ -433,17 +566,38 @@ service_current_invocation() {
 
 service_has_startup_error() {
   local invocation_id="$1"
-  service_invocation_logs "${invocation_id}" | grep -Eiq \
-    'FATAL|challenge failed|authorization failed|could not get certificate|failed to load server config|failed with result|Main process exited'
+  service_invocation_logs "${invocation_id}" | grep -Ei \
+    'FATAL|challenge failed|authorization failed|could not get certificate|failed to load server config|failed with result|Main process exited' >/dev/null
+}
+
+quarantine_connection_artifacts() {
+  local artifact kind target suffix
+  for kind in png txt; do
+    artifact="/root/hysteria2-${DOMAIN}.${kind}"
+    [[ -e "${artifact}" || -L "${artifact}" ]] || continue
+    install -d -m 0700 "${BACKUP_DIR}"
+    suffix="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
+    target="${BACKUP_DIR}/hysteria2-${DOMAIN}.stale-${suffix}.${kind}"
+    while [[ -e "${target}" || -L "${target}" ]]; do
+      suffix="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
+      target="${BACKUP_DIR}/hysteria2-${DOMAIN}.stale-${suffix}.${kind}"
+    done
+    if mv -- "${artifact}" "${target}"; then
+      [[ -L "${target}" ]] || chmod 0600 "${target}"
+      warn "已将旧连接文件移到 ${target}；本次安装完成前不要使用旧二维码或 URI。"
+    else
+      warn "无法移走旧连接文件 ${artifact}；本次安装失败时不要使用它。"
+    fi
+  done
 }
 
 show_service_diagnostics() {
   local invocation_id="$1"
   warn "${SERVICE} 未能通过启动检查。最近一次启动日志："
   service_invocation_logs "${invocation_id}" >&2
-  warn "请确认：域名 A 记录指向本机公网 IPv4；Google Cloud 和系统防火墙都放行 TCP 443 与 UDP 443；没有其他程序占用 443。"
-  warn "TCP 443 用于 Let’s Encrypt TLS-ALPN 证书申请/续期，UDP 443 用于 Hysteria 流量。修正后可执行：systemctl restart ${SERVICE}"
-  warn "若 /root/hysteria2-${DOMAIN}.{png,txt} 已存在，它们可能属于旧配置；本次安装失败时不要使用。"
+  explain_service_failure "${invocation_id}"
+  warn "本次未生成新的连接信息或二维码。"
+
 }
 
 install_hysteria() {
@@ -452,8 +606,13 @@ install_hysteria() {
   require_command curl
   require_command openssl
   require_command systemctl
+  require_command journalctl
+  require_command ss
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；请使用 Debian/Ubuntu/Rocky 等标准 VM 镜像。"
   validate_install_inputs
+  # Quarantine stale credentials before any preflight can stop the run, so a
+  # failed DNS or port check cannot leave an old QR in the expected location.
+  quarantine_connection_artifacts
   check_domain_resolution
   check_port_available
 
@@ -484,7 +643,7 @@ install_hysteria() {
   if (( ! NO_MASQUERADE && ! masquerade_owned )) && [[ -e "${MASQUERADE_DIR}/index.html" ]]; then
     die "检测到未由本安装器创建的 ${MASQUERADE_DIR}/index.html；为避免覆盖现有页面，请使用 --no-masquerade 或先自行备份/移除该文件。"
   fi
-  info "安装官方 Hysteria 2 程序和 systemd 服务..."
+  info "安装官方程序和 systemd 服务（此阶段成功仅代表程序已安装，随后仍需启动检查）..."
   run_official_installer
   id hysteria >/dev/null 2>&1 || die "官方安装器没有创建 hysteria 服务用户。"
   install -d -m 0700 "${STATE_DIR}"
@@ -498,20 +657,18 @@ install_hysteria() {
   write_config
   systemctl daemon-reload
   systemctl enable "${SERVICE}"
+  SERVICE_STARTED_AT="$(date --iso-8601=seconds)"
   if systemctl is-active --quiet "${SERVICE}"; then
     if ! systemctl restart "${SERVICE}"; then
-      show_service_diagnostics ""
-      die "服务重启失败。"
+      warn "服务重启请求失败，将继续读取日志判断是否可以修复。"
     fi
   else
     if ! systemctl start "${SERVICE}"; then
-      show_service_diagnostics ""
-      die "服务启动失败。"
+      warn "服务启动请求失败，将继续读取日志判断是否可以修复。"
     fi
   fi
   info "正在等待 ACME 证书签发并确认 UDP ${PORT} 监听（最长约 120 秒）..."
-  if ! wait_for_service_stable; then
-    show_service_diagnostics "$(service_current_invocation)"
+  if ! wait_for_service_with_recovery; then
     die "服务启动后未稳定运行。"
   fi
   print_connection_info
@@ -522,6 +679,7 @@ update_hysteria() {
   require_command curl
   require_command systemctl
   require_command ss
+  require_command journalctl
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；无法更新 systemd 服务。"
   local service_active=0
   systemctl is-active --quiet "${SERVICE}" 2>/dev/null && service_active=1 || true
@@ -529,15 +687,14 @@ update_hysteria() {
   info "更新官方 Hysteria 2 程序，保留现有配置..."
   run_official_installer
   if ((service_active)); then
+    SERVICE_STARTED_AT="$(date --iso-8601=seconds)"
     if ! systemctl restart "${SERVICE}"; then
-      show_service_diagnostics ""
-      die "更新后服务重启失败。"
+      warn "更新后服务重启请求失败，将读取日志判断原因。"
     fi
     info "正在等待更新后的服务稳定运行并确认 UDP ${PORT} 监听（最长约 120 秒）..."
-    if wait_for_service_stable; then
-      info "更新完成。"
+    if wait_for_service_with_recovery; then
+      info "更新完成，本机服务检查通过；仍需客户端验证公网连通性。"
     else
-      show_service_diagnostics "$(service_current_invocation)"
       die "更新后服务未稳定运行。"
     fi
   else
@@ -609,13 +766,17 @@ wait_for_service_stable() {
     if ! systemctl is-active --quiet "${SERVICE}"; then
       return 1
     fi
-    if [[ -z "${invocation_id}" ]]; then
-      invocation_id="$(service_current_invocation)"
+    local current_invocation
+    current_invocation="$(service_current_invocation)"
+    if [[ "${current_invocation}" != "${invocation_id}" ]]; then
+      stable_checks=0
+      invocation_id="${current_invocation}"
     fi
+    LAST_SERVICE_INVOCATION_ID="${invocation_id}"
     if service_has_startup_error "${invocation_id}"; then
       return 1
     fi
-    if service_port_is_listening; then
+    if service_port_is_listening && service_logs_match "${invocation_id}" 'server up and running'; then
       ((stable_checks += 1))
       ((stable_checks >= 3)) && return 0
     else
