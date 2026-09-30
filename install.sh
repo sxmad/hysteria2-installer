@@ -56,7 +56,7 @@ Install options:
   --domain DOMAIN       Certificate domain (required for install)
   --email EMAIL         ACME email (default: com.gpugame@gmail.com)
   --port PORT           UDP/TLS port (must be 443 for automatic ACME)
-  --password-stdin      Read the Hysteria password from stdin
+  --password-stdin      Read a custom 12-128-character password from stdin (default: random 16)
   --no-masquerade       Do not create the local static masquerade page
   --version VERSION     Install a specific Hysteria version
   --yes                 Do not ask before replacing an existing config
@@ -424,6 +424,13 @@ service_invocation_logs() {
   fi
 }
 
+service_current_invocation() {
+  local invocation_id
+  invocation_id="$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
+  [[ "${invocation_id}" == "n/a" ]] && return 0
+  printf '%s' "${invocation_id}"
+}
+
 service_has_startup_error() {
   local invocation_id="$1"
   service_invocation_logs "${invocation_id}" | grep -Eiq \
@@ -504,7 +511,7 @@ install_hysteria() {
   fi
   info "正在等待 ACME 证书签发并确认 UDP ${PORT} 监听（最长约 120 秒）..."
   if ! wait_for_service_stable; then
-    show_service_diagnostics "$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
+    show_service_diagnostics "$(service_current_invocation)"
     die "服务启动后未稳定运行。"
   fi
   print_connection_info
@@ -530,7 +537,7 @@ update_hysteria() {
     if wait_for_service_stable; then
       info "更新完成。"
     else
-      show_service_diagnostics "$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
+      show_service_diagnostics "$(service_current_invocation)"
       die "更新后服务未稳定运行。"
     fi
   else
@@ -603,7 +610,7 @@ wait_for_service_stable() {
       return 1
     fi
     if [[ -z "${invocation_id}" ]]; then
-      invocation_id="$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
+      invocation_id="$(service_current_invocation)"
     fi
     if service_has_startup_error "${invocation_id}"; then
       return 1
