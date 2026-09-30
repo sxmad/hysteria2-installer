@@ -136,7 +136,7 @@ Google Cloud VPC firewall rules are external cloud resources. A normal VM-side B
 - The script does not read or upload GCP credentials, domain credentials, or the Hysteria configuration.
 - The official installer checks a version API and sends OS and CPU architecture information to select a release; it does not collect proxy traffic.
 
-Validation scope: local Bash syntax, argument validation, configuration generation, and selected simulated failure paths. Real GCP/ACME issuance, Shadowrocket QR import, and public end-to-end connectivity have not been tested. `systemctl is-active` alone does not prove these work. Check `journalctl -u hysteria-server.service -n 100 --no-pager`, DNS, both cloud and OS firewalls, and client UDP connectivity if a connection fails.
+Validation scope: `bash -n install.sh`, help output, automatic-password checks, and the startup/recovery simulations in `tests/test_startup.sh` pass. Real GCP/ACME issuance, Shadowrocket QR import, and public end-to-end connectivity have not been tested. `systemctl is-active` alone does not prove these work. Check `journalctl -u hysteria-server.service -n 100 --no-pager`, DNS, both cloud and OS firewalls, and client UDP connectivity if a connection fails.
 
 Review the installer before running it:
 
