@@ -610,11 +610,6 @@ install_hysteria() {
   require_command ss
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；请使用 Debian/Ubuntu/Rocky 等标准 VM 镜像。"
   validate_install_inputs
-  # Quarantine stale credentials before any preflight can stop the run, so a
-  # failed DNS or port check cannot leave an old QR in the expected location.
-  quarantine_connection_artifacts
-  check_domain_resolution
-  check_port_available
 
   if [[ -f "${CONFIG_FILE}" && "${YES}" -ne 1 ]]; then
     if ! read -r -p "已有 ${CONFIG_FILE}，备份后覆盖？[y/N] " answer; then
@@ -622,6 +617,12 @@ install_hysteria() {
     fi
     [[ "${answer}" =~ ^[Yy]$ ]] || die "已取消。"
   fi
+
+  # Quarantine stale credentials before any network/port preflight can stop
+  # the run, so a failed check cannot leave an old QR in the expected path.
+  quarantine_connection_artifacts
+  check_domain_resolution
+  check_port_available
 
   backup_config
   local user_preexisted=1
