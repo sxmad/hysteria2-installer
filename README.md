@@ -1,5 +1,7 @@
 # hysteria2-installer
 
+[简体中文](README.md) | [English](README.en.md)
+
 一个面向 Google Cloud VM 的纯净 Hysteria 2 安装器，默认使用 UDP/TCP 443，适合 Shadowrocket。
 
 ## 推荐的 Google Cloud VM
@@ -31,7 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 
 - 安装官方 Hysteria 2 程序和 systemd 服务；
 - 使用端口 `443`；
-- 使用 ACME TLS-ALPN 自动申请证书；
+- 使用 Let’s Encrypt ACME TLS-ALPN 自动申请免费证书；
 - 默认邮箱为 `com.gpugame@gmail.com`；
 - 生成随机密码，并在终端显示一次；
 - 生成本机静态伪装页面，页面内容为 `asdfq`；
