@@ -37,7 +37,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 - 使用端口 `443`；
 - 使用 Let’s Encrypt ACME TLS-ALPN 自动申请免费证书；
 - 默认邮箱为 `com.gpugame@gmail.com`；
-- 生成随机密码，并在终端显示一次；
+- 生成 16 位随机密码，并在终端显示一次（使用 `--password-stdin` 时仍兼容 12-128 位自定义密码）；
 - 生成本机静态伪装页面，页面内容为 `asdfq`；
 - 使用 Hysteria 自己的 `bbr` 拥塞控制器。
 - 安装 `qrencode`，在 Web SSH 终端显示可扫描二维码，并保存 PNG 和受保护的 URI 文本。
@@ -75,6 +75,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 - 终端 Unicode 二维码，适合直接在 Google Web SSH 页面放大后扫码；
 - `/root/hysteria2-域名.png` 二维码图片；
 - `/root/hysteria2-域名.txt` 连接信息文件，权限为 `600`。
+
+安装器不会仅根据 `systemctl is-active` 就报告成功：它会等待当前服务完成 ACME 证书处理、确认本机 UDP 443 正在监听，并检查本次启动日志中的证书或配置错误。若 TCP 443 未放行、域名解析错误、证书申请失败、UDP 443 未监听或服务反复退出，安装会以错误结束并输出最近日志及排查方向，不会输出可用的 URI/二维码。云端防火墙无法从 VM 内可靠自测，仍需在 Google Cloud 中预先放行 TCP 443 和 UDP 443。
+
+首次申请证书时会等待最多约 120 秒；期间不要重复启动多个安装进程。
 
 二维码内容只包含连接 URI，其中包含密码。不要把终端截图或 PNG 发给不需要连接的人。
 

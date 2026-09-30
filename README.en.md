@@ -35,7 +35,7 @@ The installer will:
 - use port `443` by default;
 - request a free Let’s Encrypt certificate through ACME TLS-ALPN and renew it automatically;
 - use `com.gpugame@gmail.com` as the default ACME email;
-- generate a strong random password and display it once at the end;
+- generate a 16-character random password and display it once at the end (`--password-stdin` still accepts a custom 12–128-character password);
 - create a local static masquerade page whose content is `asdfq`;
 - enable Hysteria’s own `bbr` congestion controller;
 - install `qrencode`, print a scannable terminal QR code in Google Web SSH, and save a PNG and protected URI text file.
@@ -73,6 +73,10 @@ After the service starts, the script prints the following (public connectivity s
 - a Unicode QR code for scanning from the Google Web SSH page;
 - `/root/hysteria2-domain.png`, the QR image;
 - `/root/hysteria2-domain.txt`, the connection information with mode `600`.
+
+The installer does not declare success from `systemctl is-active` alone. It waits for ACME certificate processing to finish, confirms that the local UDP 443 listener is present, and checks the current service invocation for certificate or configuration errors. If TCP 443 is blocked, DNS is wrong, certificate issuance fails, UDP 443 is not listening, or the service exits repeatedly, installation ends with an error and prints recent logs plus troubleshooting guidance; it does not print a usable URI or QR code. Cloud firewall reachability cannot be reliably tested from inside the VM, so create the TCP 443 and UDP 443 rules in Google Cloud first.
+
+The first certificate request can wait for up to about 120 seconds; do not start multiple installer processes during that wait.
 
 The QR code contains the connection URI and therefore the password. Keep the terminal screenshot and PNG private.
 

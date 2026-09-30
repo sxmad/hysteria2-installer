@@ -205,10 +205,11 @@ validate_install_inputs() {
     fi
   fi
   if [[ -z "${PASSWORD}" ]]; then
-    PASSWORD="$(openssl rand -hex 24)"
+    # 12 random bytes produce 16 URL-safe Base64 characters (96 bits).
+    PASSWORD="$(openssl rand -base64 12 | tr '+/' '-_')"
   fi
   if [[ ! "${PASSWORD}" =~ ^[A-Za-z0-9._-]{12,128}$ ]]; then
-    die "密码必须为 12-128 位，只能包含字母、数字、点、下划线或短横线。"
+    die "密码必须为 12-128 位，只能包含字母、数字、点、下划线或短横线；自动生成的密码为 16 位。"
   fi
 }
 
@@ -237,7 +238,7 @@ check_port_available() {
   if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
     return
   fi
-  if command -v ss >/dev/null 2>&1 && ss -H -lntu | awk -v port=":${PORT}" '$5 ~ port "$" { found=1 } END { exit !found }'; then
+  if command -v ss >/dev/null 2>&1 && ss -H -lntu | awk -v port=":${PORT}" '$4 ~ (port "$") || $5 ~ (port "$") { found=1 } END { exit !found }'; then
     die "端口 ${PORT} 已被其他进程占用。"
   fi
 }
@@ -408,6 +409,36 @@ print_connection_info() {
   info "Google Cloud 防火墙请放行 TCP ${PORT} 和 UDP ${PORT}。"
 }
 
+service_port_is_listening() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -lun 2>/dev/null | awk -v port=":${PORT}" '$4 ~ (port "$") || $5 ~ (port "$") { found=1 } END { exit !found }'
+}
+
+service_invocation_logs() {
+  local invocation_id="$1"
+  if [[ -n "${invocation_id}" ]]; then
+    journalctl -u "${SERVICE}" _SYSTEMD_INVOCATION_ID="${invocation_id}" \
+      --no-pager -n 100 2>/dev/null || true
+  else
+    journalctl -u "${SERVICE}" --since "-3 minutes" --no-pager -n 100 2>/dev/null || true
+  fi
+}
+
+service_has_startup_error() {
+  local invocation_id="$1"
+  service_invocation_logs "${invocation_id}" | grep -Eiq \
+    'FATAL|challenge failed|authorization failed|could not get certificate|failed to load server config|failed with result|Main process exited'
+}
+
+show_service_diagnostics() {
+  local invocation_id="$1"
+  warn "${SERVICE} 未能通过启动检查。最近一次启动日志："
+  service_invocation_logs "${invocation_id}" >&2
+  warn "请确认：域名 A 记录指向本机公网 IPv4；Google Cloud 和系统防火墙都放行 TCP 443 与 UDP 443；没有其他程序占用 443。"
+  warn "TCP 443 用于 Let’s Encrypt TLS-ALPN 证书申请/续期，UDP 443 用于 Hysteria 流量。修正后可执行：systemctl restart ${SERVICE}"
+  warn "若 /root/hysteria2-${DOMAIN}.{png,txt} 已存在，它们可能属于旧配置；本次安装失败时不要使用。"
+}
+
 install_hysteria() {
   require_root
   install_prerequisites
@@ -462,17 +493,18 @@ install_hysteria() {
   systemctl enable "${SERVICE}"
   if systemctl is-active --quiet "${SERVICE}"; then
     if ! systemctl restart "${SERVICE}"; then
-      journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
+      show_service_diagnostics ""
       die "服务重启失败。"
     fi
   else
     if ! systemctl start "${SERVICE}"; then
-      journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
+      show_service_diagnostics ""
       die "服务启动失败。"
     fi
   fi
+  info "正在等待 ACME 证书签发并确认 UDP ${PORT} 监听（最长约 120 秒）..."
   if ! wait_for_service_stable; then
-    journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
+    show_service_diagnostics "$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
     die "服务启动后未稳定运行。"
   fi
   print_connection_info
@@ -482,6 +514,7 @@ update_hysteria() {
   require_root
   require_command curl
   require_command systemctl
+  require_command ss
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；无法更新 systemd 服务。"
   local service_active=0
   systemctl is-active --quiet "${SERVICE}" 2>/dev/null && service_active=1 || true
@@ -490,13 +523,14 @@ update_hysteria() {
   run_official_installer
   if ((service_active)); then
     if ! systemctl restart "${SERVICE}"; then
-      journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
+      show_service_diagnostics ""
       die "更新后服务重启失败。"
     fi
+    info "正在等待更新后的服务稳定运行并确认 UDP ${PORT} 监听（最长约 120 秒）..."
     if wait_for_service_stable; then
       info "更新完成。"
     else
-      journalctl --no-pager -u "${SERVICE}" -n 50 >&2 || true
+      show_service_diagnostics "$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
       die "更新后服务未稳定运行。"
     fi
   else
@@ -559,13 +593,30 @@ service_action() {
 }
 
 wait_for_service_stable() {
-  local attempt
-  for ((attempt = 1; attempt <= 15; attempt++)); do
+  local attempt stable_checks=0 invocation_id=""
+  # ACME TLS-ALPN may take a few seconds. Require both a live systemd
+  # process and a UDP listener, and fail early when this invocation reports
+  # an ACME/configuration error. This prevents a failed certificate request
+  # from being reported as a successful installation.
+  for ((attempt = 1; attempt <= 60; attempt++)); do
     if ! systemctl is-active --quiet "${SERVICE}"; then
       return 1
     fi
+    if [[ -z "${invocation_id}" ]]; then
+      invocation_id="$(systemctl show -p InvocationID --value "${SERVICE}" 2>/dev/null || true)"
+    fi
+    if service_has_startup_error "${invocation_id}"; then
+      return 1
+    fi
+    if service_port_is_listening; then
+      ((stable_checks += 1))
+      ((stable_checks >= 3)) && return 0
+    else
+      stable_checks=0
+    fi
     sleep 2
   done
+  return 1
 }
 
 main() {
