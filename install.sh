@@ -182,9 +182,6 @@ validate_install_inputs() {
 
   if ((PASSWORD_FROM_STDIN)); then
     IFS= read -r PASSWORD || true
-  elif [[ -z "${PASSWORD}" ]]; then
-    read -r -s -p "密码（留空则自动生成）: " PASSWORD
-    printf '\n'
   fi
   if [[ -z "${PASSWORD}" ]]; then
     PASSWORD="$(openssl rand -hex 24)"
