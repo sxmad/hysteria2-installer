@@ -21,22 +21,25 @@ If 10–15 users will frequently stream 4K video or download large files at the 
 | 5–15 users, normal web and video | `e2-standard-2` | 2 vCPUs / 8 GB | 30 GB `pd-balanced` |
 | 10–15 users, frequent 4K or downloads | `e2-standard-4` | 4 vCPUs / 16 GB | 30–50 GB `pd-balanced` |
 
-Installer revision: `2026-10-02.1`. The installer prints this revision at startup.
+Installer revision: `2026-10-02.2`. The installer prints this revision at startup.
 
 ## One-click installation
 
 Google Web SSH normally signs in as a regular user. Run `sudo -i` first to enter a root shell. Run the installation and management commands below in that root shell.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
+  install --domain hy2.example.com --email you@example.com
 ```
+
+Replace the example domain and email with your own values. Neither has a default. Providing both avoids these prompts on a fresh installation.
 
 The installer will:
 
 - install the official Hysteria 2 binary and systemd service;
 - use port `443` by default;
 - request a free Let’s Encrypt certificate through ACME TLS-ALPN and renew it automatically;
-- use `com.gpugame@gmail.com` as the default ACME email;
+- use the domain and ACME email supplied as arguments or entered during installation;
 - generate a 16-character random password and display it once at the end (`--password-stdin` still accepts a custom 12–128-character password);
 - create a local static masquerade page whose content is `asdfq`, served by Hysteria over both HTTP/3 (UDP 443) and ordinary HTTPS (TCP 443);
 - enable Hysteria’s own `bbr` congestion controller;
@@ -52,21 +55,21 @@ It does not install Nginx, Docker, panels, Linux TCP BBR sysctl tuning, cron job
 2. Allow **TCP 443 and UDP 443** in the Google Cloud VPC firewall. TCP 443 is required for ACME TLS-ALPN validation, renewal, and ordinary browser access to the static page; UDP 443 carries Hysteria/HTTP3 traffic.
 3. Use an official Debian 12/13 or Ubuntu LTS image with systemd. The installer uses the existing `apt-get` to install missing dependencies. The entry command itself requires `curl`; if missing, first run `apt-get update && apt-get install -y curl ca-certificates`. RPM distributions such as Rocky have a dependency-installation branch only: ensure `qrencode` is available (EPEL might be required), and configure the OS firewall yourself.
 
-After entering a root shell and running the command, a fresh installation asks only for the domain and generates the password automatically. The installer does not reboot the VM or modify OS or cloud firewall rules.
+After entering a root shell and running the command, the installer asks only for the domain or email missing from the arguments and generates the password automatically. The installer does not reboot the VM or modify OS or cloud firewall rules.
 
 ## Usage
 
-Without arguments, the script asks for the domain and uses the default email and port:
+Without arguments, the script asks for both the domain and email; both are required. The port defaults to 443, and the password is generated automatically:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
 ```
 
-You can also specify the domain explicitly:
+For one-command deployment, specify both the domain and email. If only one is provided, the installer asks only for the missing value. If a missing value cannot be read from input, the installer reports an error and stops:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --email com.gpugame@gmail.com
+  install --domain hy2.example.com --email you@example.com
 ```
 
 After startup and the local proxy test pass, the script prints the following (public connectivity still needs a client test):
@@ -84,6 +87,8 @@ For a transient ACME error such as a CA server error, bad nonce, or connection r
 
 Each first certificate attempt can wait for up to about 120 seconds; do not start multiple installer processes during that wait. At the start of a reinstall, same-domain QR and URI files are moved to `/var/backups/hysteria2-installer/` so a failed run cannot leave an old credential looking usable.
 
+Publishing a new installer does not modify existing deployments. The revised domain and email prompts apply only to future installation runs.
+
 The QR code contains the connection URI and therefore the password. Keep the terminal screenshot and PNG private.
 
 For automated deployments, provide a custom password through standard input:
@@ -91,7 +96,7 @@ For automated deployments, provide a custom password through standard input:
 ```bash
 printf '%s\n' 'your-safe-password' | \
   bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --password-stdin
+  install --domain hy2.example.com --email you@example.com --password-stdin
 ```
 
 Other operations:
@@ -113,7 +118,7 @@ To omit the static masquerade page:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --no-masquerade
+  install --domain hy2.example.com --email you@example.com --no-masquerade
 ```
 
 ## First Shadowrocket connection
@@ -141,7 +146,7 @@ Google Cloud VPC firewall rules are external cloud resources. A normal VM-side B
 - The official installer endpoint is a dynamic script and is not pinned to a SHA256 in this repository. Review the downloaded script before use when reproducibility is critical.
 - Failed downloads, empty files, and Bash syntax errors prevent execution of the official installer. These checks do not replace signature or trusted-hash verification. `--version` does not pin the official installer script.
 - The one-click command uses GitHub’s mutable `main` branch. For production, replace `main` with a commit that you have reviewed.
-- No fixed password, fake default email, or external Bing masquerade proxy is used.
+- No fixed password, default domain, default email, or external Bing masquerade proxy is used.
 - The configuration is written as `root:hysteria` with mode `0640`; the generated URI text file is mode `0600`.
 - The script does not read or upload GCP credentials, domain credentials, or the Hysteria configuration.
 - The official installer checks a version API and sends OS and CPU architecture information to select a release; it does not collect proxy traffic.

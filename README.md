@@ -25,20 +25,23 @@
 
 ## 一键安装
 
-安装器修订号：`2026-10-02.1`。启动时会显示该编号，可确认下载到了本次修复版。
+安装器修订号：`2026-10-02.2`。启动时会显示该编号，可确认下载到了本次修复版。
 
 Google Web SSH 通常以普通用户登录，请先执行 `sudo -i` 进入 root shell。下列安装和管理命令均在 root shell 中运行。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
+  install --domain hy2.example.com --email you@example.com
 ```
+
+请将示例域名和邮箱替换为自己的值。域名和邮箱均无默认值；同时指定两项后，全新安装无需再输入这两项。
 
 脚本默认会：
 
 - 安装官方 Hysteria 2 程序和 systemd 服务；
 - 使用端口 `443`；
 - 使用 Let’s Encrypt ACME TLS-ALPN 自动申请免费证书；
-- 默认邮箱为 `com.gpugame@gmail.com`；
+- 使用安装时指定或输入的域名和 ACME 邮箱；
 - 生成 16 位随机密码，并在终端显示一次（使用 `--password-stdin` 时仍兼容 12-128 位自定义密码）；
 - 生成本机静态伪装页面，页面内容为 `asdfq`，并由 Hysteria 同时通过 HTTP/3（UDP 443）和普通 HTTPS（TCP 443）提供；
 - 使用 Hysteria 自己的 `bbr` 拥塞控制器。
@@ -54,21 +57,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 2. 在 Google Cloud VPC 防火墙放行 **TCP 443 和 UDP 443**。TCP 443 用于 ACME TLS-ALPN 证书申请、续期和普通浏览器访问静态页；UDP 443 用于 Hysteria/HTTP3 流量。
 3. 推荐使用带 systemd 的 Debian 12/13 或 Ubuntu LTS 官方镜像。脚本使用系统自带的 `apt-get` 安装缺失依赖；入口命令本身需要 `curl`，若提示找不到它，先运行 `apt-get update && apt-get install -y curl ca-certificates`。Rocky 等 RPM 系发行版仅提供依赖安装分支，需自行确认仓库有 `qrencode`（可能需要 EPEL），并放行系统防火墙。
 
-进入 root shell 并运行命令后，全新安装只需输入域名；脚本会自动生成随机密码。脚本不会重启 VM，也不会自动修改系统或云端防火墙。
+进入 root shell 并运行命令后，脚本只询问未通过参数提供的域名或邮箱，并自动生成随机密码。脚本不会重启 VM，也不会自动修改系统或云端防火墙。
 
 ## 运行方式
 
-不带参数时会交互式询问域名；邮箱和端口使用上面的默认值，密码自动生成：
+不带参数时会交互式询问域名和邮箱；两者均须填写，端口默认为 443，密码自动生成：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh)
 ```
 
-也可以显式指定域名：
+一键部署时同时指定域名和邮箱；只指定其中一项时，仅询问缺少的另一项。缺失项未能读取到输入时会报错停止：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --email com.gpugame@gmail.com
+  install --domain hy2.example.com --email you@example.com
 ```
 
 服务启动并通过本机代理自测后，脚本会同时输出（仍需客户端验证公网连通性）：
@@ -86,6 +89,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 
 首次申请证书时每次检查最多等待约 120 秒；期间不要启动多个安装进程。重装开始时，同域旧的二维码和 URI 会移到 `/var/backups/hysteria2-installer/`，避免失败后误用旧凭据。
 
+发布新版脚本不会修改已部署的服务；本次域名和邮箱输入方式的调整只在后续运行安装命令时生效。
+
 二维码内容只包含连接 URI，其中包含密码。不要把终端截图或 PNG 发给不需要连接的人。
 
 密码不会放在命令行参数中。自动化部署可通过标准输入传入密码：
@@ -93,7 +98,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 ```bash
 printf '%s\n' 'your-safe-password' | \
   bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --password-stdin
+  install --domain hy2.example.com --email you@example.com --password-stdin
 ```
 
 其他操作：
@@ -115,7 +120,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) \
-  install --domain hy2.example.com --no-masquerade
+  install --domain hy2.example.com --email you@example.com --no-masquerade
 ```
 
 ## Shadowrocket 首次连接
@@ -141,7 +146,7 @@ Google Cloud VPC 防火墙属于 VM 外部的云资源，需在控制台或 `gcl
 - 官方安装器地址是动态脚本，未在本项目中固定 SHA256；对供应链可复现性要求较高时，应先按下面的命令审阅下载内容。
 - 下载失败、空文件或 Bash 语法检查失败时会拒绝执行官方安装器；这些检查不能代替签名或可信哈希验证。`--version` 也不会固定官方安装器脚本内容。
 - 一键命令使用 GitHub `main` 分支，生产环境可将 URL 中的 `main` 替换为你审阅过的固定 commit。
-- 不使用固定密码、虚假默认邮箱或外部 Bing 代理。
+- 不使用固定密码、默认域名、默认邮箱或外部 Bing 代理。
 - 配置文件写入权限为 `root:hysteria`、`0640`；密码只在安装完成时显示。
 - 脚本不会自动读取或上传 GCP 凭据、域名密码或 Hysteria 配置。
 - 官方安装器会查询版本 API，并发送系统类型和 CPU 架构用于选择版本；这是更新检查，不是流量统计。

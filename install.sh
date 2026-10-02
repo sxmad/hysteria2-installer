@@ -5,7 +5,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="hysteria2-installer"
-readonly SCRIPT_VERSION="2026-10-02.1"
+readonly SCRIPT_VERSION="2026-10-02.2"
 readonly OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
 readonly CONFIG_DIR="/etc/hysteria"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
@@ -16,12 +16,11 @@ readonly STATE_DIR="/var/lib/hysteria2-installer"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly BACKUP_DIR="/var/backups/hysteria2-installer"
 readonly DEFAULT_PORT="443"
-readonly DEFAULT_EMAIL="com.gpugame@gmail.com"
 readonly DEFAULT_PAGE_TEXT="asdfq"
 
 ACTION="install"
 DOMAIN=""
-EMAIL="${DEFAULT_EMAIL}"
+EMAIL=""
 PORT="${DEFAULT_PORT}"
 PASSWORD=""
 PASSWORD_FROM_STDIN=0
@@ -57,8 +56,8 @@ Usage:
   install.sh start | stop | restart | status
 
 Install options:
-  --domain DOMAIN       Certificate domain (required for install)
-  --email EMAIL         ACME email (default: com.gpugame@gmail.com)
+  --domain DOMAIN       Certificate domain (no default; prompt if omitted)
+  --email EMAIL         ACME email (no default; prompt if omitted)
   --port PORT           UDP/TLS port (must be 443 for automatic ACME)
   --password-stdin      Read a custom 12-128-character password from stdin (default: random 16)
   --no-masquerade       Do not create the local static masquerade page
@@ -182,11 +181,32 @@ parse_args() {
   done
 }
 
-validate_install_inputs() {
-  if [[ -z "${DOMAIN}" ]] && ! read -r -p "域名: " DOMAIN; then
-    die "未读取到域名，已取消。"
+collect_install_identity() {
+  [[ -n "${DOMAIN}" && -n "${EMAIL}" ]] && return 0
+  local input_fd=0
+  # A password pipe is reserved for the password. Missing identity fields
+  # must come from the terminal, never from that pipe.
+  if (( PASSWORD_FROM_STDIN )); then
+    if ! { exec {input_fd}</dev/tty; } 2>/dev/null; then
+      die "缺少域名或邮箱且没有交互终端；使用 --password-stdin 时请同时指定 --domain 和 --email。"
+    fi
+  fi
+  if [[ -z "${DOMAIN}" ]] && ! IFS= read -r -u "${input_fd}" -p "域名: " DOMAIN; then
+    die "未读取到域名，请使用 --domain 指定，已取消。"
+  fi
+  if [[ -z "${EMAIL}" ]] && ! IFS= read -r -u "${input_fd}" -p "ACME 邮箱: " EMAIL; then
+    die "未读取到邮箱，请使用 --email 指定，已取消。"
+  fi
+  if (( input_fd != 0 )); then
+    exec {input_fd}<&-
   fi
   [[ -n "${DOMAIN}" ]] || die "域名不能为空。"
+  [[ -n "${EMAIL}" ]] || die "邮箱不能为空。"
+}
+
+validate_install_inputs() {
+  [[ -n "${DOMAIN}" ]] || die "域名不能为空。"
+  [[ -n "${EMAIL}" ]] || die "邮箱不能为空。"
 
   is_valid_domain "${DOMAIN}" || die "域名格式不正确：${DOMAIN}"
   if [[ ! "${EMAIL}" =~ ^[A-Za-z0-9.!_%+\-]+@[A-Za-z0-9.-]+$ ]]; then
@@ -787,6 +807,7 @@ show_service_diagnostics() {
 install_hysteria() {
   require_root
   info "安装器版本：${SCRIPT_VERSION}"
+  collect_install_identity
   install_prerequisites
   require_command curl
   require_command openssl

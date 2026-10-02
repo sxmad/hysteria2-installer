@@ -212,13 +212,45 @@ pass 'repair loop stops after three retries'
 # Automatic passwords are exactly 16 URL-safe characters.
 reset_service_mocks
 DOMAIN='example.com'
-EMAIL='com.gpugame@gmail.com'
+EMAIL='you@example.com'
 PORT=443
 PASSWORD=''
 PASSWORD_FROM_STDIN=0
 validate_install_inputs
 [[ "${PASSWORD}" =~ ^[A-Za-z0-9._-]{16}$ ]] || fail "generated password is not 16 URL-safe characters: ${PASSWORD@Q}"
 pass 'automatic password is exactly 16 URL-safe characters'
+
+# Missing identity fields are prompted individually; explicit values must
+# neither prompt nor consume stdin reserved for a custom password.
+(
+  DOMAIN=''; EMAIL=''; PASSWORD_FROM_STDIN=0
+  collect_install_identity <<< $'hy2.example.com\nyou@example.com'
+  assert_eq hy2.example.com "${DOMAIN}" 'prompted domain'
+  assert_eq you@example.com "${EMAIL}" 'prompted email'
+)
+pass 'missing domain and email are both read from input'
+(
+  DOMAIN='hy2.example.com'; EMAIL=''
+  collect_install_identity <<< 'you@example.com'
+  assert_eq hy2.example.com "${DOMAIN}" 'explicit domain preserved'
+  assert_eq you@example.com "${EMAIL}" 'only missing email read'
+  DOMAIN=''; EMAIL='you@example.com'
+  collect_install_identity <<< 'hy2.example.com'
+  assert_eq hy2.example.com "${DOMAIN}" 'only missing domain read'
+  assert_eq you@example.com "${EMAIL}" 'explicit email preserved'
+)
+pass 'only the missing identity field is prompted'
+(
+  DOMAIN='hy2.example.com'; EMAIL='you@example.com'; PASSWORD_FROM_STDIN=1
+  { collect_install_identity; validate_install_inputs; } <<< 'customPassword16'
+  assert_eq customPassword16 "${PASSWORD}" 'identity collection preserves password stdin'
+)
+pass 'explicit domain/email preserve password stdin without prompting'
+if (DOMAIN='hy2.example.com'; EMAIL=''; collect_install_identity </dev/null) >"${TEST_TMP}/missing-email.log" 2>&1; then
+  fail 'missing email accepted without input'
+fi
+grep -Fq -- '--email' "${TEST_TMP}/missing-email.log" || fail 'missing email diagnostic absent'
+pass 'missing email without input aborts with an explicit flag hint'
 
 # Log redaction must treat password punctuation literally and cover every
 # occurrence, not merely a JSON field named auth/password.
@@ -266,6 +298,7 @@ local_connection_selftest() {
 }
 print_connection_info() { printf 'qr\n' >>"${EVENTS}"; }
 DOMAIN=example.com
+EMAIL=you@example.com
 PASSWORD=Example123456789
 NO_MASQUERADE=1
 case "${MODE}" in
