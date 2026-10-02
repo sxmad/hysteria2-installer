@@ -16,10 +16,6 @@ assert_eq() {
   local expected="$1" actual="$2" message="$3"
   [[ "${actual}" == "${expected}" ]] || fail "${message}: expected ${expected@Q}, got ${actual@Q}"
 }
-assert_true() {
-  "$@" || fail "assertion failed: $*"
-}
-
 # Load the installer functions without invoking its command-line entrypoint.
 # All systemd, journalctl and ss interactions below are deterministic mocks.
 source <(sed '/^main \"\$@\"/d' "${INSTALLER}")
@@ -84,6 +80,9 @@ ss() {
 
 sleep() { :; }
 show_service_diagnostics() { :; }
+# The production helper reads the real config. Tests model the default
+# installer path, which has TCP HTTPS masquerade enabled.
+service_masquerade_tcp_expected() { return 0; }
 
 reset_service_mocks() {
   FAKE_ACTIVE=1
@@ -124,27 +123,38 @@ FAKE_LOG=$'INFO certificate maintenance started\nFATAL failed to load server con
 assert_eq hard "$(service_failure_kind "${FAKE_INVOCATION}")" 'bind conflict classification'
 pass 'bind conflict remains hard despite certificate INFO'
 
-# A ready log and UDP socket owned by the current service PID are required.
+# A ready log plus UDP and TCP sockets owned by the current service PID are
+# required when the default HTTPS masquerade is enabled.
 reset_service_mocks
 FAKE_LOG='INFO server up and running'
-FAKE_SS='UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=3))'
+FAKE_SS=$'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=4))\nUNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=3))'
 wait_for_service_stable || fail 'current PID ready socket should pass startup stability'
-assert_eq 3 "$(cat "${SS_CALLS_FILE}")" 'stable startup check count'
-pass 'current PID plus ready log passes three consecutive checks'
+assert_eq 6 "$(cat "${SS_CALLS_FILE}")" 'stable startup check count'
+pass 'current PID plus ready TCP/UDP sockets passes three consecutive checks'
 
 # A socket owned by another process must never be accepted.
 reset_service_mocks
 FAKE_LOG='INFO server up and running'
-FAKE_SS='UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("other",pid=9999,fd=3))'
+FAKE_SS=$'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("other",pid=9999,fd=4))\nUNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("other",pid=9999,fd=3))'
 if wait_for_service_stable; then
-  fail 'unrelated UDP socket was accepted as Hysteria listener'
+  fail 'unrelated TCP/UDP sockets were accepted as Hysteria listeners'
 fi
-pass 'unrelated UDP socket does not satisfy startup check'
+pass 'unrelated TCP/UDP sockets do not satisfy startup check'
+
+# A missing TCP HTTPS listener must not be accepted when static masquerade is
+# configured, even if the UDP Hysteria listener and ready log are present.
+reset_service_mocks
+FAKE_LOG='INFO server up and running'
+FAKE_SS='UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=3))'
+if wait_for_service_stable; then
+  fail 'missing TCP HTTPS listener was accepted'
+fi
+pass 'missing TCP HTTPS listener does not satisfy startup check'
 
 # A listener without a ready log is also insufficient.
 reset_service_mocks
 FAKE_LOG='INFO maintenance started'
-FAKE_SS='UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=3))'
+FAKE_SS=$'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=4))\nUNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("hysteria",pid=4242,fd=3))'
 if wait_for_service_stable; then
   fail 'listener without ready log was accepted'
 fi
@@ -209,5 +219,84 @@ PASSWORD_FROM_STDIN=0
 validate_install_inputs
 [[ "${PASSWORD}" =~ ^[A-Za-z0-9._-]{16}$ ]] || fail "generated password is not 16 URL-safe characters: ${PASSWORD@Q}"
 pass 'automatic password is exactly 16 URL-safe characters'
+
+# Log redaction must treat password punctuation literally and cover every
+# occurrence, not merely a JSON field named auth/password.
+PASSWORD='a.b-c_d012345'
+printf '%s\n' 'auth: a.b-c_d012345 repeat a.b-c_d012345' 'keep aXb-c_d012345' >"${TEST_TMP}/secret.log"
+print_selftest_log "${TEST_TMP}/secret.log" 2>"${TEST_TMP}/redacted.log"
+grep -Fxq 'auth: [REDACTED] repeat [REDACTED]' "${TEST_TMP}/redacted.log" || fail 'secret was not fully redacted'
+grep -Fxq 'keep aXb-c_d012345' "${TEST_TMP}/redacted.log" || fail 'password was treated as a regular expression'
+pass 'self-test log redaction replaces only the literal password'
+
+# Exercise the actual install/update functions with side effects mocked.
+# All paths are redirected into TEST_TMP; no real installer or systemd runs.
+sed -e '/^main "\$@"/d' \
+  -e "s|readonly CONFIG_DIR=\"/etc/hysteria\"|readonly CONFIG_DIR=\"${TEST_TMP}/config\"|" \
+  -e "s|readonly HYSTERIA_HOME_DIR=\"/var/lib/hysteria\"|readonly HYSTERIA_HOME_DIR=\"${TEST_TMP}/home\"|" \
+  -e "s|readonly STATE_DIR=\"/var/lib/hysteria2-installer\"|readonly STATE_DIR=\"${TEST_TMP}/state\"|" \
+  -e 's|\[\[ -d /run/systemd/system \]\]|true|g' \
+  "${INSTALLER}" >"${TEST_TMP}/workflow-installer.sh"
+mkdir -p "${TEST_TMP}/state"
+cat >"${TEST_TMP}/workflow-test.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$1"
+MODE="$2"
+EVENTS="$3"
+require_root() { :; }
+require_command() { :; }
+install_prerequisites() { :; }
+quarantine_connection_artifacts() { :; }
+check_domain_resolution() { :; }
+check_port_available() { :; }
+backup_config() { :; }
+state_owns_directory() { return 1; }
+id() { return 0; }
+install() { :; }
+chmod() { :; }
+write_masquerade_page() { :; }
+write_config() { :; }
+systemctl() { return 0; }
+run_official_installer() { printf 'installer\n' >>"${EVENTS}"; }
+wait_for_service_with_recovery() { printf 'startup\n' >>"${EVENTS}"; }
+local_connection_selftest() {
+  printf 'selftest\n' >>"${EVENTS}"
+  [[ "${MODE}" != selftest_fail ]]
+}
+print_connection_info() { printf 'qr\n' >>"${EVENTS}"; }
+DOMAIN=example.com
+PASSWORD=Example123456789
+NO_MASQUERADE=1
+case "${MODE}" in
+  invalid_install) VERSION=v1.3.0; install_hysteria ;;
+  invalid_update) VERSION=v1.3.0; update_hysteria ;;
+  missing_update) update_hysteria ;;
+  *) install_hysteria ;;
+esac
+EOF
+
+run_workflow_test() {
+  bash "${TEST_TMP}/workflow-test.sh" "${TEST_TMP}/workflow-installer.sh" "$1" \
+    "${TEST_TMP}/$1.events" >"${TEST_TMP}/$1.log" 2>&1
+}
+if run_workflow_test selftest_fail; then
+  fail 'install accepted a failed functional self-test'
+fi
+assert_eq $'installer\nstartup\nselftest' "$(cat "${TEST_TMP}/selftest_fail.events")" 'failed self-test stops before QR generation'
+pass 'actual install workflow cannot output credentials/QR after self-test failure'
+run_workflow_test selftest_pass || fail 'successful mocked installation was rejected'
+assert_eq $'installer\nstartup\nselftest\nqr' "$(cat "${TEST_TMP}/selftest_pass.events")" 'QR follows successful self-test'
+pass 'actual install workflow outputs QR only after successful self-test'
+for mode in invalid_install invalid_update missing_update; do
+  if run_workflow_test "${mode}"; then
+    fail "${mode} unexpectedly succeeded"
+  fi
+  [[ ! -s "${TEST_TMP}/${mode}.events" ]] || fail "${mode} reached the official installer"
+done
+grep -Fq 'Hysteria 2 正式版本' "${TEST_TMP}/invalid_install.log" || fail 'install did not validate explicit version'
+grep -Fq 'Hysteria 2 正式版本' "${TEST_TMP}/invalid_update.log" || fail 'update did not validate explicit version'
+grep -Fq '新设备请先执行 install' "${TEST_TMP}/missing_update.log" || fail 'missing installation was not identified'
+pass 'invalid install/update versions and update-before-install stop before installation'
 
 printf 'All startup tests passed.\n'

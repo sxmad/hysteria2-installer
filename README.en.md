@@ -21,6 +21,8 @@ If 10–15 users will frequently stream 4K video or download large files at the 
 | 5–15 users, normal web and video | `e2-standard-2` | 2 vCPUs / 8 GB | 30 GB `pd-balanced` |
 | 10–15 users, frequent 4K or downloads | `e2-standard-4` | 4 vCPUs / 16 GB | 30–50 GB `pd-balanced` |
 
+Installer revision: `2026-10-02.1`. The installer prints this revision at startup.
+
 ## One-click installation
 
 Google Web SSH normally signs in as a regular user. Run `sudo -i` first to enter a root shell. Run the installation and management commands below in that root shell.
@@ -36,7 +38,7 @@ The installer will:
 - request a free Let’s Encrypt certificate through ACME TLS-ALPN and renew it automatically;
 - use `com.gpugame@gmail.com` as the default ACME email;
 - generate a 16-character random password and display it once at the end (`--password-stdin` still accepts a custom 12–128-character password);
-- create a local static masquerade page whose content is `asdfq`;
+- create a local static masquerade page whose content is `asdfq`, served by Hysteria over both HTTP/3 (UDP 443) and ordinary HTTPS (TCP 443);
 - enable Hysteria’s own `bbr` congestion controller;
 - install `qrencode`, print a scannable terminal QR code in Google Web SSH, and save a PNG and protected URI text file.
 
@@ -46,8 +48,8 @@ It does not install Nginx, Docker, panels, Linux TCP BBR sysctl tuning, cron job
 
 ## Required preparation
 
-1. Point a domain directly to the VM’s public IP. Do not put it behind Cloudflare’s orange-cloud proxy.
-2. Allow **TCP 443 and UDP 443** in the Google Cloud VPC firewall. TCP 443 is required for ACME TLS-ALPN validation and renewal; UDP 443 carries Hysteria traffic.
+1. Use a separate domain/subdomain for the new VM. Point its A record directly to this VM’s static external IPv4. Keep an AAAA record only if it points to this VM’s working public IPv6; remove stale records. Do not use Cloudflare’s orange-cloud proxy. DNS preflight checks resolution only, not ownership of the resolved IP.
+2. Allow **TCP 443 and UDP 443** in the Google Cloud VPC firewall. TCP 443 is required for ACME TLS-ALPN validation, renewal, and ordinary browser access to the static page; UDP 443 carries Hysteria/HTTP3 traffic.
 3. Use an official Debian 12/13 or Ubuntu LTS image with systemd. The installer uses the existing `apt-get` to install missing dependencies. The entry command itself requires `curl`; if missing, first run `apt-get update && apt-get install -y curl ca-certificates`. RPM distributions such as Rocky have a dependency-installation branch only: ensure `qrencode` is available (EPEL might be required), and configure the OS firewall yourself.
 
 After entering a root shell and running the command, a fresh installation asks only for the domain and generates the password automatically. The installer does not reboot the VM or modify OS or cloud firewall rules.
@@ -67,14 +69,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --email com.gpugame@gmail.com
 ```
 
-After the service starts, the script prints the following (public connectivity still needs a client test):
+After startup and the local proxy test pass, the script prints the following (public connectivity still needs a client test):
 
 - a `hysteria2://` URI for Shadowrocket;
 - a Unicode QR code for scanning from the Google Web SSH page;
 - `/root/hysteria2-domain.png`, the QR image;
 - `/root/hysteria2-domain.txt`, the connection information with mode `600`.
 
-The installer does not declare success from `systemctl is-active` alone. It waits for ACME certificate processing to finish, confirms that the local UDP 443 listener is present, and checks the current service invocation for certificate or configuration errors. It prints a URI or QR code only after the certificate succeeds, the service is stable, and the local UDP 443 listener is present.
+The installer does not declare success from `systemctl is-active` alone. It waits for ACME certificate processing to finish, confirms that the local UDP 443 listener is present, confirms the TCP 443 listener belongs to the current Hysteria process when static masquerading is enabled, and checks the current service invocation for certificate or configuration errors. It then verifies the local HTTPS page and starts a temporary official Hysteria client, accessing `https://www.google.com/generate_204` through SOCKS5. A URI/QR is exported only after HTTP 204; failures print diagnostics and return a nonzero status. The temporary client config ends in `.yaml`; the password is not a command-line argument. Its process and files are cleaned up on exit.
+
+After installation, an ordinary browser can open `https://your-domain/` and see the `asdfq` page. Shadowrocket uses Hysteria over UDP 443; the browser page uses TCP 443, and both can share the same port number. With `--no-masquerade`, no static page or TCP HTTPS masquerade is created.
 
 For a transient ACME error such as a CA server error, bad nonce, or connection reset, the installer prints the cause and offers `1` to repair and restart, or `2` to abort; it allows at most three repair retries. A TCP 443 timeout/refusal, firewall or DNS/CAA problem, certificate rate limit, port conflict, configuration error, or missing UDP 443 listener cannot be reliably repaired by the installer, so it explains the issue and stops. Cloud UDP firewall reachability cannot be reliably tested from inside the VM, so create both the TCP 443 and UDP 443 rules in Google Cloud first.
 
@@ -112,9 +116,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --no-masquerade
 ```
 
+## First Shadowrocket connection
+
+Import the QR and confirm Hysteria2, port 443, the current generated password, and TLS SNI/Peer matching the domain. Displaying `sni` as `peer` is not by itself an error. Select the new node and temporarily use global Proxy routing for the first test; restore your routing rules afterwards. A working browser page verifies TCP HTTPS, not public UDP proxy reachability.
+
+`update` requires an existing Hysteria executable and configuration. It preserves the configuration/password rather than migrating it. Use `install` on a new VM.
+
 ## Nginx and BBR
 
-Nginx is unnecessary. Hysteria 2 handles ACME, TLS, HTTP/3 masquerading, and the static page itself; installing Nginx could also take over port 443.
+Nginx is unnecessary. Hysteria 2 handles ACME, TLS, HTTP/3, TCP HTTPS masquerading, and the static page itself; installing Nginx could also take over TCP port 443.
 
 The installer does not change Linux TCP BBR sysctl settings. Hysteria 2 uses QUIC, and `congestion.type: bbr` is Hysteria’s own congestion controller. Extra TCP BBR tuning does not guarantee faster Hysteria or YouTube traffic and adds system changes.
 
@@ -136,7 +146,15 @@ Google Cloud VPC firewall rules are external cloud resources. A normal VM-side B
 - The script does not read or upload GCP credentials, domain credentials, or the Hysteria configuration.
 - The official installer checks a version API and sends OS and CPU architecture information to select a release; it does not collect proxy traffic.
 
-Validation scope: `bash -n install.sh`, help output, automatic-password checks, and the startup/recovery simulations in `test_startup.sh` pass. Real GCP/ACME issuance, Shadowrocket QR import, and public end-to-end connectivity have not been tested. `systemctl is-active` alone does not prove these work. Check `journalctl -u hysteria-server.service -n 100 --no-pager`, DNS, both cloud and OS firewalls, and client UDP connectivity if a connection fails.
+Validation scope: `bash -n install.sh`, `bash install.sh --help`, and `bash test_startup.sh` cover syntax, 16-character passwords, listener ownership, and certificate recovery. `test_proxy.sh` uses a real Hysteria binary with isolated test certificates and an HTTPS target to verify TLS, authentication, SOCKS forwarding, and failure cleanup. Test certificates are never used by the installer. These tests are not a fresh GCP/systemd/ACME installation or phone/public-network test; installation runs the real Google HTTP 204 test again on your VM. Cloud UDP firewall and client-network reachability still require an external client test.
+
+This review used Hysteria v2.12.3. The restricted test runner required explicit `HYSTERIA_TEST_NO_PID_CHECK=1` because netlink/PID inspection is unavailable; ownership checks were separately covered by mocks. The production installer has no bypass flag. The optional Google test could not pass because this runner blocks outbound DNS, so Internet validation is unverified. On a normal Linux host, run:
+
+```bash
+bash test_startup.sh
+HYSTERIA_TEST_BINARY=/usr/local/bin/hysteria bash test_proxy.sh
+```
+
 
 Review the installer before running it:
 

@@ -25,6 +25,8 @@
 
 ## 一键安装
 
+安装器修订号：`2026-10-02.1`。启动时会显示该编号，可确认下载到了本次修复版。
+
 Google Web SSH 通常以普通用户登录，请先执行 `sudo -i` 进入 root shell。下列安装和管理命令均在 root shell 中运行。
 
 ```bash
@@ -38,7 +40,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 - 使用 Let’s Encrypt ACME TLS-ALPN 自动申请免费证书；
 - 默认邮箱为 `com.gpugame@gmail.com`；
 - 生成 16 位随机密码，并在终端显示一次（使用 `--password-stdin` 时仍兼容 12-128 位自定义密码）；
-- 生成本机静态伪装页面，页面内容为 `asdfq`；
+- 生成本机静态伪装页面，页面内容为 `asdfq`，并由 Hysteria 同时通过 HTTP/3（UDP 443）和普通 HTTPS（TCP 443）提供；
 - 使用 Hysteria 自己的 `bbr` 拥塞控制器。
 - 安装 `qrencode`，在 Web SSH 终端显示可扫描二维码，并保存 PNG 和受保护的 URI 文本。
 
@@ -48,8 +50,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
 
 ## 安装前必须准备
 
-1. 准备一个直接解析到 VM 公网 IP 的域名。不要把域名放在 Cloudflare 橙云代理后面。
-2. 在 Google Cloud VPC 防火墙放行 **TCP 443 和 UDP 443**。TCP 443 用于 ACME TLS-ALPN 证书申请和续期，UDP 443 用于 Hysteria 流量。
+1. 为新 VM 准备独立域名或子域名，A 记录直接指向该 VM 的固定公网 IPv4。若有 AAAA 记录，必须指向本机可用的公网 IPv6；否则删除旧 AAAA。不要把域名放在 Cloudflare 橙云代理后面。脚本的 DNS 预检只确认能解析，不证明解析目标就是本机。
+2. 在 Google Cloud VPC 防火墙放行 **TCP 443 和 UDP 443**。TCP 443 用于 ACME TLS-ALPN 证书申请、续期和普通浏览器访问静态页；UDP 443 用于 Hysteria/HTTP3 流量。
 3. 推荐使用带 systemd 的 Debian 12/13 或 Ubuntu LTS 官方镜像。脚本使用系统自带的 `apt-get` 安装缺失依赖；入口命令本身需要 `curl`，若提示找不到它，先运行 `apt-get update && apt-get install -y curl ca-certificates`。Rocky 等 RPM 系发行版仅提供依赖安装分支，需自行确认仓库有 `qrencode`（可能需要 EPEL），并放行系统防火墙。
 
 进入 root shell 并运行命令后，全新安装只需输入域名；脚本会自动生成随机密码。脚本不会重启 VM，也不会自动修改系统或云端防火墙。
@@ -69,14 +71,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --email com.gpugame@gmail.com
 ```
 
-服务启动后，脚本会同时输出（仍需客户端验证公网连通性）：
+服务启动并通过本机代理自测后，脚本会同时输出（仍需客户端验证公网连通性）：
 
 - Shadowrocket 可用的 `hysteria2://` URI；
 - 终端 Unicode 二维码，适合直接在 Google Web SSH 页面放大后扫码；
 - `/root/hysteria2-域名.png` 二维码图片；
 - `/root/hysteria2-域名.txt` 连接信息文件，权限为 `600`。
 
-安装器不会仅根据 `systemctl is-active` 就报告成功：它会等待当前服务完成 ACME 证书处理、确认本机 UDP 443 正在监听，并检查本次启动日志中的证书或配置错误。只有证书申请成功、服务稳定运行且 UDP 443 在本机监听时，才会输出 URI 和二维码。
+安装器不会仅根据 `systemctl is-active` 就报告成功：它会等待当前服务完成 ACME 证书处理、确认本机 UDP 443 正在监听；默认静态伪装还会确认本机 TCP 443 由当前 Hysteria 进程监听，并检查本次启动日志中的证书或配置错误。确认服务已成功加载证书、稳定运行且所需监听均正常后，还会自动检查本机 HTTPS 页面，并启动临时官方 Hysteria 客户端，通过 SOCKS5 访问 `https://www.google.com/generate_204`。只有返回 HTTP 204 才输出 URI 和二维码；失败打印原因并返回非零状态。临时配置固定使用 `.yaml` 后缀，密码不放入进程命令行，自测结束清理临时客户端和文件。
+
+安装完成后，普通浏览器可以直接访问 `https://你的域名/`，看到页面内容 `asdfq`。Shadowrocket 使用 Hysteria 的 UDP 443 连接；浏览器静态页使用 TCP 443，两者可以共用端口号。如果使用 `--no-masquerade`，则不会创建静态页，也不会启用 TCP HTTPS 伪装。
 
 如果日志显示的是 ACME 的临时错误（例如 CA 服务错误、bad nonce 或连接重置），脚本会先打印原因并提供选择：`1` 修复并重启重试，`2` 中断；最多允许 3 次修复重试。明确的 TCP 443 超时/拒绝、防火墙或 DNS/CAA 问题、证书速率限制、端口占用、配置错误和 UDP 443 未监听无法由脚本可靠修复，会直接说明问题并中断。云端 UDP 防火墙是否允许入站流量无法从 VM 内可靠自测，因此仍需在 Google Cloud 中预先放行 TCP 443 和 UDP 443。
 
@@ -101,7 +105,7 @@ systemctl restart hysteria-server.service
 bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/main/install.sh) uninstall
 ```
 
-更新前会备份现有配置。重装已有配置时会要求确认是否覆盖，并备份到 `/var/backups/hysteria2-installer/`；使用 `--yes` 可跳过确认。
+`update` 只接受已有 Hysteria 程序和配置的机器，并保留配置；它不会把旧配置自动转换成新版，也不会重置现有密码。新 VM 请使用 `install`。更新前会备份现有配置。重装已有配置时会要求确认是否覆盖，并备份到 `/var/backups/hysteria2-installer/`；使用 `--yes` 可跳过确认。
 
 卸载只清理状态记录明确归本安装器创建的用户和数据目录；已有或归属不明的目录会保留。不要在本安装器创建的 `/var/lib/hysteria` 中存放其他文件。配置备份和 `/root/hysteria2-域名.{txt,png}` 会保留供恢复使用，其中含有凭据，需要时请自行删除。
 
@@ -114,9 +118,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/sxmad/hysteria2-installer/ma
   install --domain hy2.example.com --no-masquerade
 ```
 
+## Shadowrocket 首次连接
+
+扫码导入后，确认类型为 Hysteria2，端口为 443，密码与本次安装输出一致，TLS SNI/Peer 为当前域名。客户端把 `sni` 显示为 `peer` 本身不代表错误。首次测试选择新节点，将全局路由临时设为“代理”，通过后再恢复自己的分流规则。浏览器能打开静态页只证明 TCP HTTPS 正常，不证明 UDP 代理可达。
+
 ## 关于 Nginx 和 BBR
 
-不需要 Nginx。Hysteria 2 自己处理 ACME、TLS、HTTP/3 伪装和静态页面；安装 Nginx 还可能抢占 443 端口。
+不需要 Nginx。Hysteria 2 自己处理 ACME、TLS、HTTP/3、TCP HTTPS 伪装和静态页面；安装 Nginx 还可能抢占 TCP 443 端口。
 
 这里没有默认修改 Linux TCP BBR 的 sysctl。Hysteria 2 使用 QUIC，配置中的 `congestion.type: bbr` 是 Hysteria 自己的拥塞控制器，与 Linux TCP BBR 是两回事。额外安装或修改 TCP BBR 不保证提升 Hysteria 或 YouTube 速度，也会增加系统改动，因此保持关闭。
 
@@ -138,7 +146,15 @@ Google Cloud VPC 防火墙属于 VM 外部的云资源，需在控制台或 `gcl
 - 脚本不会自动读取或上传 GCP 凭据、域名密码或 Hysteria 配置。
 - 官方安装器会查询版本 API，并发送系统类型和 CPU 架构用于选择版本；这是更新检查，不是流量统计。
 
-验证范围：已通过 `bash -n install.sh`、`bash install.sh --help`、自动密码校验，以及 `test_startup.sh` 中的启动状态、进程归属、证书错误分类和恢复路径模拟测试。尚未在真实 GCP VM 和域名上完成 ACME 签发、Shadowrocket 扫码及公网端到端测试；`systemctl is-active` 不能单独证明这些步骤成功。连接失败时先检查 `journalctl -u hysteria-server.service -n 100 --no-pager`，再检查 DNS、云端/系统防火墙及客户端 UDP 连通性。
+验证范围：`bash -n install.sh`、`bash install.sh --help`、`bash test_startup.sh` 覆盖语法、16 位密码、启动监听归属和证书恢复路径。`test_proxy.sh` 使用真实 Hysteria 程序及隔离的测试证书/HTTPS 目标，验证本机认证、TLS、SOCKS 转发和失败时的清理；测试证书仅用于测试，不写入安装配置。这些测试不等于新 GCP VM 的 ACME 签发或手机公网验收；安装时会在你的 VM 上再运行真实 Google HTTP 204 自测。公网 UDP 防火墙、客户端网络和 Shadowrocket 仍需外部连接验证。
+
+本次真实程序测试使用 Hysteria v2.12.3。受限测试环境不能查询 netlink/PID，因此仅在测试脚本中显式启用了 `HYSTERIA_TEST_NO_PID_CHECK=1`，监听进程归属另外通过模拟测试覆盖；生产安装器没有此跳过选项。本环境的 Google 测试因 DNS 出站受限未通过，不能据此声称公网验收成功。普通 Linux 可运行：
+
+```bash
+bash test_startup.sh
+HYSTERIA_TEST_BINARY=/usr/local/bin/hysteria bash test_proxy.sh
+```
+
 
 安装前如需审阅脚本：
 

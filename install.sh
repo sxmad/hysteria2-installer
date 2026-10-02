@@ -5,6 +5,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="hysteria2-installer"
+readonly SCRIPT_VERSION="2026-10-02.1"
 readonly OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
 readonly CONFIG_DIR="/etc/hysteria"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
@@ -45,6 +46,7 @@ info() {
 }
 
 usage() {
+  printf 'Installer revision: %s\n\n' "${SCRIPT_VERSION}"
   cat <<'EOF'
 Hysteria 2 clean installer
 
@@ -197,9 +199,7 @@ validate_install_inputs() {
   if [[ "${PORT}" != "443" ]]; then
     die "为使用 ACME TLS-ALPN，当前安装器只支持端口 443。"
   fi
-  if [[ -n "${VERSION}" && ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    die "版本必须类似 v2.7.2。"
-  fi
+  validate_version
 
   if ((PASSWORD_FROM_STDIN)); then
     if ! IFS= read -r PASSWORD && [[ -z "${PASSWORD}" ]]; then
@@ -212,6 +212,12 @@ validate_install_inputs() {
   fi
   if [[ ! "${PASSWORD}" =~ ^[A-Za-z0-9._-]{12,128}$ ]]; then
     die "密码必须为 12-128 位，只能包含字母、数字、点、下划线或短横线；自动生成的密码为 16 位。"
+  fi
+}
+
+validate_version() {
+  if [[ -n "${VERSION}" && ! "${VERSION}" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
+    die "版本必须是 Hysteria 2 正式版本，格式类似 v2.12.3。"
   fi
 }
 
@@ -247,7 +253,8 @@ check_port_available() {
 
 download_official_installer() {
   local target="$1"
-  if ! curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  if ! curl -q --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+    --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 --retry-max-time 250 \
     "${OFFICIAL_INSTALLER_URL}" -o "${target}"; then
     rm -f -- "${target}"
     warn "官方安装器下载失败。"
@@ -355,6 +362,9 @@ EOF
 
 masquerade:
   type: file
+  # Serve the same page over normal TCP HTTPS as well as HTTP/3/QUIC.
+  # TCP and UDP may use the same numeric port.
+  listenHTTPS: :443
   file:
     dir: ${MASQUERADE_DIR}
 EOF
@@ -386,10 +396,15 @@ print_connection_info() {
   chmod 0600 "/root/hysteria2-${DOMAIN}.txt"
 
   info ""
-  info "服务器安装与本机启动检查通过。"
+  info "服务器安装、本机证书校验和 Hysteria 代理访问测试通过。"
   warn "公网 UDP 入站及客户端连通性尚未验证，请在 Shadowrocket 中实际连接确认。"
   info "域名: ${DOMAIN}"
-  info "端口: ${PORT}（UDP；证书续期还需要 TCP ${PORT}）"
+  if (( NO_MASQUERADE )); then
+    info "端口: ${PORT}（UDP；证书申请和续期还需要 TCP ${PORT}）"
+  else
+    info "端口: ${PORT}（UDP Hysteria + TCP HTTPS 静态页）"
+    info "静态页: https://${DOMAIN}/"
+  fi
   info "密码: ${PASSWORD}"
   info "SNI: ${DOMAIN}"
   info "Shadowrocket URI（可手动导入）:"
@@ -412,13 +427,182 @@ print_connection_info() {
   info "请保持 Google Cloud 防火墙放行 TCP ${PORT} 和 UDP ${PORT}。"
 }
 
+select_selftest_port() {
+  local attempt candidate listeners
+  # Check all bind addresses, not only loopback. A later PID ownership check
+  # also protects against a port being taken between this check and bind().
+  if ! listeners="$(ss -H -ltn 2>/dev/null)"; then
+    return 1
+  fi
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    candidate=$((20000 + (RANDOM * 2 + RANDOM) % 40000))
+    if ! awk -v port=":${candidate}" \
+      '$4 ~ (port "$") || $5 ~ (port "$") { found=1 } END { exit !found }' <<<"${listeners}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+selftest_client_owns_listener() {
+  local client_pid="$1" client_port="$2"
+  [[ "${client_pid}" =~ ^[1-9][0-9]*$ && "${client_port}" =~ ^[0-9]+$ ]] || return 1
+  ss -H -ltnp 2>/dev/null | awk -v address="127.0.0.1:${client_port}" -v owner="pid=${client_pid}," \
+    '$1 == "LISTEN" && $4 == address && index($0, owner) { found=1 } END { exit !found }'
+}
+
+print_selftest_log() {
+  local log_file="$1" line
+  [[ -r "${log_file}" ]] || return 0
+  # Replace the literal secret, including any occurrences outside JSON fields.
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ -n "${PASSWORD}" ]]; then
+      line="${line//"${PASSWORD}"/[REDACTED]}"
+    fi
+    printf '%s\n' "${line}" >&2
+  done < <(tail -n 40 -- "${log_file}")
+}
+
+local_connection_selftest() (
+  # A subshell keeps traps and exit handling separate from the caller's shell.
+  # Every fallible step is checked explicitly: this function is called by !,
+  # which disables Bash errexit even inside nested functions/subshells.
+  trap - ERR
+  local selftest_dir="" client_pid="" client_port="" http_code="" attempt ready=0
+  cleanup_selftest() {
+    local cleanup_attempt
+    if [[ -n "${client_pid}" ]]; then
+      kill "${client_pid}" 2>/dev/null || true
+      for ((cleanup_attempt = 0; cleanup_attempt < 10; cleanup_attempt++)); do
+        kill -0 "${client_pid}" 2>/dev/null || break
+        sleep 0.2
+      done
+      kill -KILL "${client_pid}" 2>/dev/null || true
+      wait "${client_pid}" 2>/dev/null || true
+    fi
+    [[ -z "${selftest_dir}" ]] || rm -rf -- "${selftest_dir}"
+  }
+  trap cleanup_selftest EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if [[ ! -x /usr/local/bin/hysteria ]]; then
+    warn "本机自测失败：找不到 /usr/local/bin/hysteria；未生成连接信息或二维码。"
+    exit 1
+  fi
+  if ! selftest_dir="$(mktemp -d /tmp/hysteria2-selftest.XXXXXXXX)"; then
+    warn "无法创建本机自测临时目录；未生成连接信息或二维码。"
+    exit 1
+  fi
+
+  if (( ! NO_MASQUERADE )); then
+    info "检查本机 HTTPS 证书、域名和静态页面..."
+    if ! http_code="$(curl -q --proto '=https' --tlsv1.2 --noproxy '*' \
+      --silent --show-error --connect-timeout 5 --max-time 15 \
+      --resolve "${DOMAIN}:${PORT}:127.0.0.1" \
+      --output "${selftest_dir}/page.html" --write-out '%{http_code}' \
+      "https://${DOMAIN}:${PORT}/" 2>"${selftest_dir}/https.log")"; then
+      warn "本机 HTTPS 自测失败：检查证书信任、域名和 TCP ${PORT} 监听；未生成连接信息或二维码。"
+      print_selftest_log "${selftest_dir}/https.log"
+      exit 1
+    fi
+    if [[ "${http_code}" != 200 ]] || ! grep -Fq -- "<body>${DEFAULT_PAGE_TEXT}</body>" "${selftest_dir}/page.html"; then
+      warn "本机 HTTPS 页面自测失败（HTTP ${http_code} 或页面内容不符）；未生成连接信息或二维码。"
+      exit 1
+    fi
+  fi
+
+  if ! client_port="$(select_selftest_port)"; then
+    warn "无法为本机自测选择空闲端口；未生成连接信息或二维码。"
+    exit 1
+  fi
+  # The .yaml suffix is required by Hysteria's config format detection.
+  if ! cat >"${selftest_dir}/client.yaml" <<EOF
+server: 127.0.0.1:${PORT}
+auth: '${PASSWORD}'
+tls:
+  sni: ${DOMAIN}
+socks5:
+  listen: 127.0.0.1:${client_port}
+EOF
+  then
+    warn "无法写入本机自测配置；未生成连接信息或二维码。"
+    exit 1
+  fi
+  info "检查本机 Hysteria 认证和代理出站（HTTPS Google 204）..."
+  /usr/local/bin/hysteria client -c "${selftest_dir}/client.yaml" \
+    >"${selftest_dir}/client.log" 2>&1 &
+  client_pid=$!
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    if ! kill -0 "${client_pid}" 2>/dev/null; then
+      break
+    fi
+    if selftest_client_owns_listener "${client_pid}" "${client_port}"; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( ! ready )); then
+    warn "本机 Hysteria 客户端未就绪：检查下方配置、证书或认证错误；未生成连接信息或二维码。"
+    print_selftest_log "${selftest_dir}/client.log"
+    exit 1
+  fi
+  # -q ignores curlrc, and an empty noproxy prevents environment NO_PROXY
+  # settings from bypassing SOCKS. DNS resolution also travels via Hysteria.
+  if ! http_code="$(curl -q --proto '=https' --tlsv1.2 --noproxy '' \
+    --socks5-hostname "127.0.0.1:${client_port}" \
+    --silent --show-error --connect-timeout 5 --max-time 15 \
+    --retry 1 --retry-delay 1 --retry-max-time 31 \
+    --output /dev/null --write-out '%{http_code}' \
+    https://www.google.com/generate_204 2>"${selftest_dir}/proxy.log")"; then
+    warn "本机 Hysteria 代理出站失败：检查下方认证、证书、DNS 或外网访问错误；未生成连接信息或二维码。"
+    print_selftest_log "${selftest_dir}/client.log"
+    print_selftest_log "${selftest_dir}/proxy.log"
+    exit 1
+  fi
+  if [[ "${http_code}" != 204 ]]; then
+    warn "本机代理测试返回 HTTP ${http_code}，预期为 204；检查 VM 出站和 DNS，未生成连接信息或二维码。"
+    print_selftest_log "${selftest_dir}/client.log"
+    exit 1
+  fi
+  if ! kill -0 "${client_pid}" 2>/dev/null || \
+    ! selftest_client_owns_listener "${client_pid}" "${client_port}"; then
+    warn "本机自测客户端异常退出；未生成连接信息或二维码。"
+    print_selftest_log "${selftest_dir}/client.log"
+    exit 1
+  fi
+  info "本机 Hysteria 代理自测通过：HTTP 204（公网 UDP 入站仍需外部客户端验证）。"
+)
+
 service_port_is_listening() {
   local service_pid
   service_pid="$(systemctl show -p MainPID --value "${SERVICE}" 2>/dev/null)" || return 1
   [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   # Verify the socket belongs to this service, not an unrelated UDP listener.
   ss -H -lunp 2>/dev/null | awk -v port=":${PORT}" -v owner="pid=${service_pid}," \
-    '($4 ~ (port "$") || $5 ~ (port "$")) && index($0, owner) { found=1 } END { exit !found }'
+    '$1 == "UNCONN" && ($4 ~ (port "$") || $5 ~ (port "$")) && index($0, owner) { found=1 } END { exit !found }'
+}
+
+service_masquerade_tcp_expected() {
+  (( NO_MASQUERADE )) && return 1
+  # New installations write listenHTTPS. If an older custom config has no
+  # such setting, preserve its behavior during update rather than inventing a
+  # new TCP listener unexpectedly.
+  [[ ! -r "${CONFIG_FILE}" ]] && return 0
+  grep -Eq '^[[:space:]]*listenHTTPS:[[:space:]]*:443([[:space:]]*(#.*)?)?$' "${CONFIG_FILE}"
+}
+
+service_tcp_port_is_listening() {
+  service_masquerade_tcp_expected || return 0
+  local service_pid
+  service_pid="$(systemctl show -p MainPID --value "${SERVICE}" 2>/dev/null)" || return 1
+  [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  # TCP and UDP may share the numeric port; verify the TCP listener belongs to
+  # the current Hysteria process rather than an unrelated web server.
+  ss -H -ltnp 2>/dev/null | awk -v port=":${PORT}" -v owner="pid=${service_pid}," \
+    '$1 == "LISTEN" && ($4 ~ (port "$") || $5 ~ (port "$")) && index($0, owner) { found=1 } END { exit !found }'
 }
 
 service_invocation_logs() {
@@ -478,7 +662,7 @@ explain_service_failure() {
   elif service_logs_match "${invocation_id}" 'invalid config|failed to load server config|yaml:|unknown field'; then
     warn "配置加载失败：请根据上方日志修正配置；脚本不会盲目反复申请证书。"
   else
-    warn "服务未就绪或缺少本服务的 UDP ${PORT} 监听；无法确认可用，停止安装。"
+    warn "服务未就绪或缺少本服务的 UDP/TCP ${PORT} 监听；无法确认可用，停止安装。"
   fi
 }
 
@@ -602,6 +786,7 @@ show_service_diagnostics() {
 
 install_hysteria() {
   require_root
+  info "安装器版本：${SCRIPT_VERSION}"
   install_prerequisites
   require_command curl
   require_command openssl
@@ -672,11 +857,17 @@ install_hysteria() {
   if ! wait_for_service_with_recovery; then
     die "服务启动后未稳定运行。"
   fi
+  if ! local_connection_selftest; then
+    die "本机功能自测未通过，安装未完成。服务和配置已保留，修复上述问题后可重试。"
+  fi
   print_connection_info
 }
 
 update_hysteria() {
   require_root
+  validate_version
+  [[ -x /usr/local/bin/hysteria && -s "${CONFIG_FILE}" ]] || \
+    die "未找到已安装的 Hysteria 程序和服务配置；新设备请先执行 install。"
   require_command curl
   require_command systemctl
   require_command ss
@@ -731,6 +922,7 @@ uninstall_hysteria() {
     rm -f "${temp_file}"
     return 1
   fi
+  systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || warn "无法禁用服务，请检查残留的开机启动链接。"
   if ! bash "${temp_file}" --remove; then
     rm -f "${temp_file}"
     return 1
@@ -759,10 +951,11 @@ service_action() {
 
 wait_for_service_stable() {
   local attempt stable_checks=0 invocation_id=""
-  # ACME TLS-ALPN may take a few seconds. Require both a live systemd
-  # process and a UDP listener, and fail early when this invocation reports
-  # an ACME/configuration error. This prevents a failed certificate request
-  # from being reported as a successful installation.
+  # ACME TLS-ALPN may take a few seconds. Require a live systemd process, the
+  # Hysteria UDP listener, and the TCP HTTPS masquerade listener when enabled;
+  # fail early when this invocation reports an ACME/configuration error. This
+  # prevents a failed certificate request or missing static page listener from
+  # being reported as a successful installation.
   for ((attempt = 1; attempt <= 60; attempt++)); do
     if ! systemctl is-active --quiet "${SERVICE}"; then
       return 1
@@ -777,7 +970,8 @@ wait_for_service_stable() {
     if service_has_startup_error "${invocation_id}"; then
       return 1
     fi
-    if service_port_is_listening && service_logs_match "${invocation_id}" 'server up and running'; then
+    if service_port_is_listening && service_tcp_port_is_listening && \
+      service_logs_match "${invocation_id}" 'server up and running'; then
       ((stable_checks += 1))
       ((stable_checks >= 3)) && return 0
     else
