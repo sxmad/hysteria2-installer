@@ -52,11 +52,19 @@ systemctl show "${TEST_UNIT}" \
   -p FragmentPath -p DropInPaths --no-pager
 systemctl start "${TEST_UNIT}"
 for ((attempt=0; attempt<45; attempt++)); do
-  [[ "$(systemctl show "${TEST_UNIT}" -p Result --value)" == start-limit-hit ]] && break
+  # Ubuntu systemd retains Result=exit-code after the start limit is hit.
+  if [[ "$(systemctl show "${TEST_UNIT}" -p ActiveState --value)" == failed && \
+        "$(systemctl show "${TEST_UNIT}" -p NRestarts --value)" == 5 ]]; then
+    break
+  fi
   sleep 1
 done
-[[ "$(systemctl show "${TEST_UNIT}" -p Result --value)" == start-limit-hit ]]
-[[ "$(systemctl show "${TEST_UNIT}" -p NRestarts --value)" -ge 4 ]]
+[[ "$(systemctl show "${TEST_UNIT}" -p ActiveState --value)" == failed ]]
+[[ "$(systemctl show "${TEST_UNIT}" -p NRestarts --value)" == 5 ]]
+# Verify retries really stopped for longer than RestartSec.
+sleep 6
+[[ "$(systemctl show "${TEST_UNIT}" -p ActiveState --value)" == failed ]]
+[[ "$(systemctl show "${TEST_UNIT}" -p NRestarts --value)" == 5 ]]
 [[ "$(systemctl show "${TEST_UNIT}" -p MemoryAccounting --value)" == yes ]]
 printf 'PASS: failed process is retried and repeated failures reach the start limit\n'
 
