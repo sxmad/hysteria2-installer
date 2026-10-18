@@ -289,6 +289,8 @@ install() { :; }
 chmod() { :; }
 write_masquerade_page() { :; }
 write_config() { :; }
+check_service_policy_path() { :; }
+write_service_policy() { printf 'recovery\n' >>"${EVENTS}"; }
 systemctl() { return 0; }
 run_official_installer() { printf 'installer\n' >>"${EVENTS}"; }
 wait_for_service_with_recovery() { printf 'startup\n' >>"${EVENTS}"; }
@@ -316,10 +318,10 @@ run_workflow_test() {
 if run_workflow_test selftest_fail; then
   fail 'install accepted a failed functional self-test'
 fi
-assert_eq $'installer\nstartup\nselftest' "$(cat "${TEST_TMP}/selftest_fail.events")" 'failed self-test stops before QR generation'
+assert_eq $'installer\nrecovery\nstartup\nselftest' "$(cat "${TEST_TMP}/selftest_fail.events")" 'failed self-test stops before QR generation'
 pass 'actual install workflow cannot output credentials/QR after self-test failure'
 run_workflow_test selftest_pass || fail 'successful mocked installation was rejected'
-assert_eq $'installer\nstartup\nselftest\nqr' "$(cat "${TEST_TMP}/selftest_pass.events")" 'QR follows successful self-test'
+assert_eq $'installer\nrecovery\nstartup\nselftest\nqr' "$(cat "${TEST_TMP}/selftest_pass.events")" 'QR follows successful self-test'
 pass 'actual install workflow outputs QR only after successful self-test'
 for mode in invalid_install invalid_update missing_update; do
   if run_workflow_test "${mode}"; then

@@ -5,11 +5,14 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="hysteria2-installer"
-readonly SCRIPT_VERSION="2026-10-02.2"
+readonly SCRIPT_VERSION="2026-10-18.1"
 readonly OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
 readonly CONFIG_DIR="/etc/hysteria"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 readonly SERVICE="hysteria-server.service"
+readonly SERVICE_DROPIN_DIR="/etc/systemd/system/${SERVICE}.d"
+readonly SERVICE_POLICY_FILE="${SERVICE_DROPIN_DIR}/20-hysteria2-installer.conf"
+readonly SERVICE_POLICY_MARKER="# Managed by hysteria2-installer: recovery policy"
 readonly HYSTERIA_HOME_DIR="/var/lib/hysteria"
 readonly MASQUERADE_DIR="${HYSTERIA_HOME_DIR}/masquerade"
 readonly STATE_DIR="/var/lib/hysteria2-installer"
@@ -311,6 +314,54 @@ run_official_installer() {
     fi
   fi
   rm -f "${temp_file}"
+}
+
+check_service_policy_path() {
+  [[ ! -L "${SERVICE_DROPIN_DIR}" && ! -L "${SERVICE_POLICY_FILE}" ]] || \
+    die "服务恢复配置路径是符号链接，拒绝覆盖：${SERVICE_POLICY_FILE}"
+  [[ ! -e "${SERVICE_DROPIN_DIR}" || -d "${SERVICE_DROPIN_DIR}" ]] || \
+    die "服务恢复配置目录被其他文件占用：${SERVICE_DROPIN_DIR}"
+  if [[ -e "${SERVICE_POLICY_FILE}" ]] && \
+    { [[ ! -f "${SERVICE_POLICY_FILE}" ]] || ! grep -Fxq -- "${SERVICE_POLICY_MARKER}" "${SERVICE_POLICY_FILE}"; }; then
+    die "服务恢复配置不是本安装器管理的文件，请先备份并移走：${SERVICE_POLICY_FILE}"
+  fi
+}
+
+write_service_policy() {
+  check_service_policy_path
+  install -d -m 0755 "${SERVICE_DROPIN_DIR}"
+  local policy_tmp
+  policy_tmp="$(mktemp "${SERVICE_DROPIN_DIR}/.recovery.XXXXXX")"
+  if ! cat >"${policy_tmp}" <<EOF
+${SERVICE_POLICY_MARKER}
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+MemoryAccounting=true
+EOF
+  then
+    rm -f -- "${policy_tmp}"
+    return 1
+  fi
+  if ! chmod 0644 "${policy_tmp}" || ! mv -f -- "${policy_tmp}" "${SERVICE_POLICY_FILE}"; then
+    rm -f -- "${policy_tmp}"
+    return 1
+  fi
+}
+
+remove_service_policy() {
+  if [[ ! -L "${SERVICE_DROPIN_DIR}" && ! -L "${SERVICE_POLICY_FILE}" && -f "${SERVICE_POLICY_FILE}" ]] && \
+    grep -Fxq -- "${SERVICE_POLICY_MARKER}" "${SERVICE_POLICY_FILE}"; then
+    rm -f -- "${SERVICE_POLICY_FILE}"
+    # Leave administrator-provided drop-ins and nonempty directories intact.
+    rmdir -- "${SERVICE_DROPIN_DIR}" 2>/dev/null || true
+  elif [[ -e "${SERVICE_POLICY_FILE}" || -L "${SERVICE_POLICY_FILE}" || -L "${SERVICE_DROPIN_DIR}" ]]; then
+    warn "已保留非本安装器管理的服务恢复配置：${SERVICE_POLICY_FILE}"
+  fi
 }
 
 backup_config() {
@@ -829,6 +880,7 @@ install_hysteria() {
   quarantine_connection_artifacts
   check_domain_resolution
   check_port_available
+  check_service_policy_path
 
   backup_config
   local user_preexisted=1
@@ -862,6 +914,7 @@ install_hysteria() {
   fi
   write_masquerade_page
   write_config
+  write_service_policy
   systemctl daemon-reload
   systemctl enable "${SERVICE}"
   SERVICE_STARTED_AT="$(date --iso-8601=seconds)"
@@ -894,11 +947,14 @@ update_hysteria() {
   require_command ss
   require_command journalctl
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；无法更新 systemd 服务。"
+  check_service_policy_path
   local service_active=0
   systemctl is-active --quiet "${SERVICE}" 2>/dev/null && service_active=1 || true
   backup_config
   info "更新官方 Hysteria 2 程序，保留现有配置..."
   run_official_installer
+  write_service_policy
+  systemctl daemon-reload
   if ((service_active)); then
     SERVICE_STARTED_AT="$(date --iso-8601=seconds)"
     if ! systemctl restart "${SERVICE}"; then
@@ -948,6 +1004,8 @@ uninstall_hysteria() {
     rm -f "${temp_file}"
     return 1
   fi
+  remove_service_policy
+  systemctl daemon-reload
   rm -f "${CONFIG_FILE}"
   if ((home_owned)); then
     rm -rf "${HYSTERIA_HOME_DIR}"

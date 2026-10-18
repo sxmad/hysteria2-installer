@@ -1,0 +1,28 @@
+name: Installer regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Syntax and startup regressions
+        run: |
+          for script in install.sh test_startup.sh test_proxy.sh test_service_systemd.sh; do
+            bash -n "$script"
+          done
+          bash install.sh --help
+          bash test_startup.sh
+      - name: Recovery policy and lifecycle regressions
+        run: python3 test_service_policy.py
+      - name: Real systemd failure recovery and manual stop
+        run: sudo env HYSTERIA_TEST_SYSTEMD=1 bash test_service_systemd.sh
