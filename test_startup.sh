@@ -100,6 +100,7 @@ reset_service_mocks() {
   LAST_SERVICE_INVOCATION_ID=""
   SERVICE_STARTED_AT=""
   PORT=443
+  HTTPS_PORT=443
 }
 
 # Classification: a FATAL config wrapper that contains badNonce is a
@@ -279,6 +280,9 @@ EVENTS="$3"
 require_root() { :; }
 require_command() { :; }
 install_prerequisites() { :; }
+lego() { :; }
+obtain_certificate() { printf 'certificate\n' >>"${EVENTS}"; }
+write_renewal_service() { printf 'renewal\n' >>"${EVENTS}"; }
 quarantine_connection_artifacts() { :; }
 check_domain_resolution() { :; }
 check_port_available() { :; }
@@ -318,10 +322,10 @@ run_workflow_test() {
 if run_workflow_test selftest_fail; then
   fail 'install accepted a failed functional self-test'
 fi
-assert_eq $'installer\nrecovery\nstartup\nselftest' "$(cat "${TEST_TMP}/selftest_fail.events")" 'failed self-test stops before QR generation'
+assert_eq $'installer\ncertificate\nrenewal\nrecovery\nstartup\nselftest' "$(cat "${TEST_TMP}/selftest_fail.events")" 'failed self-test stops before QR generation'
 pass 'actual install workflow cannot output credentials/QR after self-test failure'
 run_workflow_test selftest_pass || fail 'successful mocked installation was rejected'
-assert_eq $'installer\nrecovery\nstartup\nselftest\nqr' "$(cat "${TEST_TMP}/selftest_pass.events")" 'QR follows successful self-test'
+assert_eq $'installer\ncertificate\nrenewal\nrecovery\nstartup\nselftest\nqr' "$(cat "${TEST_TMP}/selftest_pass.events")" 'QR follows successful self-test'
 pass 'actual install workflow outputs QR only after successful self-test'
 for mode in invalid_install invalid_update missing_update; do
   if run_workflow_test "${mode}"; then

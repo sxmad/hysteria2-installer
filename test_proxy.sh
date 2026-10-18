@@ -156,6 +156,7 @@ udp.bind(('127.0.0.1', port))
 print(port)
 PY
 )"
+  HTTPS_PORT="${PORT}"
   cat >"${TEST_TMP}/server.yaml" <<EOF
 listen: 127.0.0.1:${PORT}
 tls:

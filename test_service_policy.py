@@ -42,6 +42,8 @@ class RecoveryPolicyTests(unittest.TestCase):
                 for line in lines
             ) + "\n"
         source = source.replace("/usr/local/bin/hysteria", str(self.binary))
+        source = source.replace("/etc/systemd/system", str(self.root / "units"))
+        source = source.replace("/usr/local/sbin/hysteria-renew-cert", str(self.root / "renew.sh"))
         source = source.replace("[[ -d /run/systemd/system ]]", "true")
         self.functions = self.root / "functions.sh"
         self.functions.write_text(source)

@@ -5,7 +5,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="hysteria2-installer"
-readonly SCRIPT_VERSION="2026-10-18.1"
+readonly SCRIPT_VERSION="2026-10-18.2"
 readonly OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
 readonly CONFIG_DIR="/etc/hysteria"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
@@ -19,6 +19,14 @@ readonly STATE_DIR="/var/lib/hysteria2-installer"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly BACKUP_DIR="/var/backups/hysteria2-installer"
 readonly DEFAULT_PORT="443"
+readonly CERT_FILE="${CONFIG_DIR}/cert.pem"
+readonly KEY_FILE="${CONFIG_DIR}/key.pem"
+readonly LEGO_DIR="${HYSTERIA_HOME_DIR}/lego"
+readonly RENEW_SCRIPT="/usr/local/sbin/hysteria-renew-cert"
+readonly RENEW_SERVICE="hysteria-cert-renew.service"
+readonly RENEW_TIMER="hysteria-cert-renew.timer"
+# Shared with both new and legacy Trojan certificate renewal jobs.
+readonly ACME_LOCK="/run/lock/trojan-cert-renew.lock"
 readonly DEFAULT_PAGE_TEXT="asdfq"
 
 ACTION="install"
@@ -28,6 +36,10 @@ PORT="${DEFAULT_PORT}"
 PASSWORD=""
 PASSWORD_FROM_STDIN=0
 NO_MASQUERADE=0
+HTTPS_PORT=0
+LEGO_BIN=""
+CERT_CREATED=0
+RENEW_TIMER_WAS_ACTIVE=0
 YES=0
 VERSION=""
 QR_FILE=""
@@ -61,7 +73,9 @@ Usage:
 Install options:
   --domain DOMAIN       Certificate domain (no default; prompt if omitted)
   --email EMAIL         ACME email (no default; prompt if omitted)
-  --port PORT           UDP/TLS port (must be 443 for automatic ACME)
+  --port PORT           Hysteria UDP port (1-65535; default: 443)
+  --https-port PORT      Optional TCP HTTPS page (default: disabled)
+                        Certificate issuance/renewal always uses TCP 80
   --password-stdin      Read a custom 12-128-character password from stdin (default: random 16)
   --no-masquerade       Do not create the local static masquerade page
   --version VERSION     Install a specific Hysteria version
@@ -92,6 +106,10 @@ install_prerequisites() {
   local packages=()
   command -v curl >/dev/null 2>&1 || packages+=(curl)
   command -v openssl >/dev/null 2>&1 || packages+=(openssl)
+  command -v lego >/dev/null 2>&1 || packages+=(lego)
+  command -v flock >/dev/null 2>&1 || packages+=(util-linux)
+  command -v python3 >/dev/null 2>&1 || packages+=(python3)
+  command -v timeout >/dev/null 2>&1 || packages+=(coreutils)
   command -v qrencode >/dev/null 2>&1 || packages+=(qrencode)
   command -v ss >/dev/null 2>&1 || packages+=(iproute2)
   [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
@@ -161,6 +179,11 @@ parse_args() {
       --password-stdin)
         PASSWORD_FROM_STDIN=1
         ;;
+      --https-port)
+        (($# >= 2)) || die "--https-port 需要参数。"
+        HTTPS_PORT="$2"
+        shift
+        ;;
       --no-masquerade)
         NO_MASQUERADE=1
         ;;
@@ -219,15 +242,14 @@ validate_install_inputs() {
   local email_domain="${EMAIL#*@}"
   [[ "${email_local}" != .* && "${email_local}" != *. && "${email_local}" != *..* ]] || die "邮箱格式不正确：${EMAIL}"
   is_valid_domain "${email_domain}" || die "邮箱域名格式不正确：${EMAIL}"
-  if [[ "${PORT}" != "443" ]]; then
-    die "为使用 ACME TLS-ALPN，当前安装器只支持端口 443。"
-  fi
+  validate_ports
   validate_version
 
   if ((PASSWORD_FROM_STDIN)); then
     if ! IFS= read -r PASSWORD && [[ -z "${PASSWORD}" ]]; then
       die "未从标准输入读取到密码，已取消。"
     fi
+    [[ -n "${PASSWORD}" ]] || die "指定的密码不能为空；已取消，未生成替代密码。"
   fi
   if [[ -z "${PASSWORD}" ]]; then
     # 12 random bytes produce 16 URL-safe Base64 characters (96 bits).
@@ -265,13 +287,54 @@ check_domain_resolution() {
   fi
 }
 
+validate_ports() {
+  [[ "${PORT}" =~ ^[0-9]{1,5}$ ]] || die "UDP 端口必须为 1-65535。"
+  PORT=$((10#${PORT}))
+  ((PORT >= 1 && PORT <= 65535)) || die "UDP 端口必须为 1-65535。"
+  [[ "${HTTPS_PORT}" =~ ^[0-9]{1,5}$ ]] || die "HTTPS 端口必须为 0 或 1-65535。"
+  HTTPS_PORT=$((10#${HTTPS_PORT}))
+  ((HTTPS_PORT >= 0 && HTTPS_PORT <= 65535 && HTTPS_PORT != 80)) || die "HTTPS 端口不能为 80 或超出范围；0 表示关闭。"
+  (( ! NO_MASQUERADE || HTTPS_PORT == 0 )) || die "--no-masquerade 不能与 --https-port 同时使用。"
+}
+
+port_in_use() { [[ -n "$(ss -H -ltn "sport = :$1")" ]]; }
+
+check_listener_available() {
+  local protocol="$1" port="$2" service_pid="" listeners
+  service_pid="$(systemctl show -p MainPID --value "${SERVICE}" 2>/dev/null || true)"
+  listeners="$(ss -H -ln"${protocol}"p "sport = :${port}")" || die "无法检查 ${protocol}/${port} 端口。"
+  [[ -n "${listeners}" ]] || return 0
+  if [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]] &&
+    ! grep -Fv "pid=${service_pid}," <<<"${listeners}" | grep -q .; then
+    return 0
+  fi
+  die "${protocol}/${port} 已被其他进程占用；请选择其他端口，现有服务不会被停止。"
+}
+
 check_port_available() {
-  if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
-    return
-  fi
-  if command -v ss >/dev/null 2>&1 && ss -H -lntu | awk -v port=":${PORT}" '$4 ~ (port "$") || $5 ~ (port "$") { found=1 } END { exit !found }'; then
-    die "端口 ${PORT} 已被其他进程占用。"
-  fi
+  check_listener_available u "${PORT}"
+  ((HTTPS_PORT == 0)) || check_listener_available t "${HTTPS_PORT}"
+}
+
+load_installed_ports() {
+  local values
+  values="$(python3 - "${CONFIG_FILE}" <<'PYPORT'
+import re, sys
+text = open(sys.argv[1]).read()
+def port(key, default):
+    match = re.search(r'^' + key + r':\s*[\"\']?[^\n#]*?:([0-9]+)[\"\']?\s*(?:#.*)?$', text, re.M)
+    if match:
+        return int(match.group(1))
+    if re.search(r'^' + key + r':', text, re.M):
+        raise SystemExit('Unsupported listener; inspect config before updating')
+    return default
+print(port('listen', 443))
+print(port(r'\s+listenHTTPS', 0))
+PYPORT
+)" || die "无法读取现有监听端口。"
+  PORT="${values%%$'\n'*}"
+  HTTPS_PORT="${values##*$'\n'}"
+  validate_ports
 }
 
 download_official_installer() {
@@ -403,6 +466,171 @@ EOF
   rm -f "${page}"
 }
 
+sync_certificate() {
+  local cert="${LEGO_DIR}/certificates/${DOMAIN}.crt" key="${LEGO_DIR}/certificates/${DOMAIN}.key"
+  [[ -s "${cert}" && -s "${key}" ]] || die "Let’s Encrypt 证书文件不完整。"
+  install -d -o root -g hysteria -m 0750 "${CONFIG_DIR}"
+  install -o root -g hysteria -m 0644 "${cert}" "${CERT_FILE}.new"
+  install -o root -g hysteria -m 0640 "${key}" "${KEY_FILE}.new"
+  mv -f "${CERT_FILE}.new" "${CERT_FILE}"
+  mv -f "${KEY_FILE}.new" "${KEY_FILE}"
+}
+
+cert_valid() {
+  local cert="${LEGO_DIR}/certificates/${DOMAIN}.crt" key="${LEGO_DIR}/certificates/${DOMAIN}.key" cert_pub key_pub
+  [[ -s "${cert}" && -s "${key}" ]] || return 1
+  openssl x509 -in "${cert}" -noout -checkend 2592000 >/dev/null 2>&1 || return 1
+  # x509 -checkhost may return success even on a hostname mismatch.
+  openssl verify -trusted "${cert}" -partial_chain -verify_hostname "${DOMAIN}" "${cert}" >/dev/null 2>&1 || return 1
+  cert_pub="$(openssl x509 -in "${cert}" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)" || return 1
+  key_pub="$(openssl pkey -in "${key}" -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)" || return 1
+  [[ -n "${cert_pub}" && "${cert_pub}" == "${key_pub}" ]]
+}
+
+obtain_certificate() {
+  if ! cert_valid; then CERT_CREATED=1; fi
+  (
+    exec 9>"${ACME_LOCK}"
+    flock -w 300 9 || die "等待另一协议的证书操作超时，请稍后重试。"
+    obtain_certificate_locked
+  )
+}
+
+obtain_certificate_locked() {
+  install -d -o root -g root -m 0700 "${LEGO_DIR}"
+  if cert_valid; then
+    info "复用仍有效的 Let’s Encrypt 证书。"
+    sync_certificate
+    return 0
+  fi
+  if port_in_use 80; then
+    die "TCP 80 已被其他进程占用；HTTP-01 需要此端口，安装器不会停止该进程。"
+  fi
+  CERT_CREATED=1
+  local attempt=0 log="$(mktemp)" status=0 acme_action=run
+  if [[ -s "${LEGO_DIR}/certificates/${DOMAIN}.crt" && -s "${LEGO_DIR}/certificates/${DOMAIN}.key" ]]; then
+    acme_action=renew
+  fi
+  while ((attempt < 3)); do
+    ((attempt += 1))
+    if [[ "${acme_action}" == renew ]]; then
+      info "续期 Let’s Encrypt HTTP-01 证书（第 ${attempt}/3 次，需要 TCP 80）..."
+    else
+      info "申请 Let’s Encrypt HTTP-01 证书（第 ${attempt}/3 次，需要 TCP 80）..."
+    fi
+    status=0
+    if [[ "${acme_action}" == renew ]]; then
+      timeout 180s "${LEGO_BIN}" --path "${LEGO_DIR}" --domains "${DOMAIN}" --http renew --days 30 >"${log}" 2>&1 || status=$?
+    else
+      timeout 180s "${LEGO_BIN}" --accept-tos --path "${LEGO_DIR}" --email "${EMAIL}" \
+        --domains "${DOMAIN}" --http run >"${log}" 2>&1 || status=$?
+    fi
+    if ((status == 0)) && cert_valid; then
+      cat "${log}"
+      rm -f "${log}"
+      sync_certificate
+      return 0
+    fi
+    cat "${log}" >&2
+    if grep -Eiq 'rate.?limit|too many|retry.?after' "${log}"; then
+      rm -f "${log}"
+      die "证书申请触发 CA 速率限制；请等待后再试，安装已中断。"
+    fi
+    if grep -Eiq 'Fetching http://.*(Timeout during connect|Connection refused)' "${log}"; then
+      rm -f "${log}"
+      warn "HTTP-01 验证连接超时或被拒绝；请核对 ${DOMAIN} 的解析与 VM 公网 IP。"
+      warn "确认公网入站 TCP 80 已放行，GCP 规则匹配该 VM 的 VPC/网络标记，主机防火墙也允许；--port ${PORT} 不改变证书验证端口。"
+      die "请修复 TCP 80 可达性后重新运行安装命令，避免连续申请失败；未生成连接信息。"
+    fi
+    if ((attempt >= 3)); then
+      rm -f "${log}"
+      die "证书申请连续失败 3 次，安装已中断。"
+    fi
+    local answer
+    if [[ -t 0 ]]; then
+      read -r -p "证书申请失败，请先检查并处理上面的错误。1. 重试  2. 中断: " answer || answer=2
+    else
+      answer=2
+    fi
+    [[ "${answer}" == 1 ]] || { rm -f "${log}"; die "已中断，未生成连接信息。"; }
+    sleep $((attempt * 5))
+  done
+}
+
+render_renewal_script() {
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\numask 077\n'
+  printf '%s=%q\n' domain "${DOMAIN}" lego_dir "${LEGO_DIR}" \
+    cert_file "${CERT_FILE}" key_file "${KEY_FILE}" lego_bin "${LEGO_BIN}" \
+    pending_file "${STATE_DIR}/certificate-reload.pending" \
+    lock_file "${ACME_LOCK}"
+  # Only the header is expanded here. Runtime variables must remain literal.
+  cat <<'EOF'
+exec 9>"${lock_file}"
+flock -w 300 9 || { echo 'HTTP-01 lock timeout; retry later' >&2; exit 1; }
+cert="${lego_dir}/certificates/${domain}.crt"
+key="${lego_dir}/certificates/${domain}.key"
+valid_pair() {
+  local seconds="$1" cert_pub key_pub
+  [[ -s "${cert}" && -s "${key}" ]] || return 1
+  openssl x509 -in "${cert}" -noout -checkend "${seconds}" >/dev/null 2>&1 || return 1
+  openssl verify -trusted "${cert}" -partial_chain -verify_hostname "${domain}" "${cert}" >/dev/null 2>&1 || return 1
+  cert_pub="$(openssl x509 -in "${cert}" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)" || return 1
+  key_pub="$(openssl pkey -in "${key}" -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)" || return 1
+  [[ -n "${cert_pub}" && "${cert_pub}" == "${key_pub}" ]]
+}
+if ! valid_pair 2592000; then
+  # HTTP-01 always uses TCP 80, independent of the Hysteria UDP port.
+  # Never stop either proxy to renew a certificate.
+  timeout 180s "${lego_bin}" --path "${lego_dir}" --domains "${domain}" --http renew --days 30
+fi
+valid_pair 0 || { echo 'hysteria-cert-renew: invalid certificate/key; keeping deployed files' >&2; exit 1; }
+if cmp -s "${cert}" "${cert_file}" && cmp -s "${key}" "${key_file}" && [[ ! -e "${pending_file}" ]]; then
+  exit 0
+fi
+# Also retry deployment when lego already renewed but a previous copy/reload failed.
+touch "${pending_file}"
+trap 'rm -f "${cert_file}.new" "${key_file}.new"' EXIT
+install -o root -g hysteria -m 0644 "${cert}" "${cert_file}.new"
+install -o root -g hysteria -m 0640 "${key}" "${key_file}.new"
+mv -f "${cert_file}.new" "${cert_file}"
+mv -f "${key_file}.new" "${key_file}"
+# Hysteria reads the TLS files on each new handshake. No service restart.
+rm -f "${pending_file}"
+EOF
+}
+
+write_renewal_service() {
+  [[ -n "${LEGO_BIN}" && -x "${LEGO_BIN}" ]] || die "未找到 lego，可先执行 apt-get install lego。"
+  render_renewal_script >"${RENEW_SCRIPT}"
+  bash -n "${RENEW_SCRIPT}"
+  chmod 0750 "${RENEW_SCRIPT}"
+  cat >"/etc/systemd/system/${RENEW_SERVICE}" <<EOF
+[Unit]
+Description=Renew Hysteria TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=600s
+ExecStart=${RENEW_SCRIPT}
+EOF
+  cat >"/etc/systemd/system/${RENEW_TIMER}" <<EOF
+[Unit]
+Description=Daily Hysteria TLS certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:47:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "${RENEW_TIMER}" >/dev/null
+}
+
 write_config() {
   install -d -m 0755 "${CONFIG_DIR}"
   local config_tmp
@@ -410,12 +638,9 @@ write_config() {
   if ! cat >"${config_tmp}" <<EOF
 listen: :${PORT}
 
-acme:
-  domains:
-    - ${DOMAIN}
-  email: '${EMAIL}'
-  ca: letsencrypt
-  type: tls
+tls:
+  cert: ${CERT_FILE}
+  key: ${KEY_FILE}
 
 auth:
   type: password
@@ -433,9 +658,6 @@ EOF
 
 masquerade:
   type: file
-  # Serve the same page over normal TCP HTTPS as well as HTTP/3/QUIC.
-  # TCP and UDP may use the same numeric port.
-  listenHTTPS: :443
   file:
     dir: ${MASQUERADE_DIR}
 EOF
@@ -443,6 +665,9 @@ EOF
       rm -f "${config_tmp}"
       return 1
     fi
+  fi
+  if ((HTTPS_PORT > 0)); then
+    printf '  listenHTTPS: :%s\n' "${HTTPS_PORT}" >>"${config_tmp}"
   fi
   if ! chown root:hysteria "${config_tmp}"; then
     rm -f "${config_tmp}"
@@ -470,11 +695,11 @@ print_connection_info() {
   info "服务器安装、本机证书校验和 Hysteria 代理访问测试通过。"
   warn "公网 UDP 入站及客户端连通性尚未验证，请在 Shadowrocket 中实际连接确认。"
   info "域名: ${DOMAIN}"
-  if (( NO_MASQUERADE )); then
-    info "端口: ${PORT}（UDP；证书申请和续期还需要 TCP ${PORT}）"
-  else
-    info "端口: ${PORT}（UDP Hysteria + TCP HTTPS 静态页）"
-    info "静态页: https://${DOMAIN}/"
+  info "端口: ${PORT}（UDP/QUIC；证书签发和续期需要 TCP 80）"
+  if (( ! NO_MASQUERADE && HTTPS_PORT > 0)); then
+    info "静态页: https://${DOMAIN}:${HTTPS_PORT}/（TCP HTTPS）"
+  elif (( ! NO_MASQUERADE )); then
+    info "静态页仅通过 HTTP/3 提供；未额外占用 TCP HTTPS 端口。"
   fi
   info "密码: ${PASSWORD}"
   info "SNI: ${DOMAIN}"
@@ -495,7 +720,8 @@ print_connection_info() {
     warn "未找到 qrencode，无法显示二维码；URI 已保存到 /root/hysteria2-${DOMAIN}.txt。"
   fi
   info ""
-  info "请保持 Google Cloud 防火墙放行 TCP ${PORT} 和 UDP ${PORT}。"
+  info "请保持 Google Cloud 防火墙放行 TCP 80 和 UDP ${PORT}。"
+  ((HTTPS_PORT == 0)) || info "另需放行静态页 TCP ${HTTPS_PORT}。"
 }
 
 select_selftest_port() {
@@ -567,14 +793,14 @@ local_connection_selftest() (
     exit 1
   fi
 
-  if (( ! NO_MASQUERADE )); then
+  if (( ! NO_MASQUERADE && HTTPS_PORT > 0)); then
     info "检查本机 HTTPS 证书、域名和静态页面..."
     if ! http_code="$(curl -q --proto '=https' --tlsv1.2 --noproxy '*' \
       --silent --show-error --connect-timeout 5 --max-time 15 \
-      --resolve "${DOMAIN}:${PORT}:127.0.0.1" \
+      --resolve "${DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
       --output "${selftest_dir}/page.html" --write-out '%{http_code}' \
-      "https://${DOMAIN}:${PORT}/" 2>"${selftest_dir}/https.log")"; then
-      warn "本机 HTTPS 自测失败：检查证书信任、域名和 TCP ${PORT} 监听；未生成连接信息或二维码。"
+      "https://${DOMAIN}:${HTTPS_PORT}/" 2>"${selftest_dir}/https.log")"; then
+      warn "本机 HTTPS 自测失败：检查证书信任、域名和 TCP ${HTTPS_PORT} 监听；未生成连接信息或二维码。"
       print_selftest_log "${selftest_dir}/https.log"
       exit 1
     fi
@@ -657,12 +883,7 @@ service_port_is_listening() {
 }
 
 service_masquerade_tcp_expected() {
-  (( NO_MASQUERADE )) && return 1
-  # New installations write listenHTTPS. If an older custom config has no
-  # such setting, preserve its behavior during update rather than inventing a
-  # new TCP listener unexpectedly.
-  [[ ! -r "${CONFIG_FILE}" ]] && return 0
-  grep -Eq '^[[:space:]]*listenHTTPS:[[:space:]]*:443([[:space:]]*(#.*)?)?$' "${CONFIG_FILE}"
+  ((HTTPS_PORT > 0))
 }
 
 service_tcp_port_is_listening() {
@@ -672,7 +893,7 @@ service_tcp_port_is_listening() {
   [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   # TCP and UDP may share the numeric port; verify the TCP listener belongs to
   # the current Hysteria process rather than an unrelated web server.
-  ss -H -ltnp 2>/dev/null | awk -v port=":${PORT}" -v owner="pid=${service_pid}," \
+  ss -H -ltnp 2>/dev/null | awk -v port=":${HTTPS_PORT}" -v owner="pid=${service_pid}," \
     '$1 == "LISTEN" && ($4 ~ (port "$") || $5 ~ (port "$")) && index($0, owner) { found=1 } END { exit !found }'
 }
 
@@ -717,13 +938,13 @@ service_failure_kind() {
 explain_service_failure() {
   local invocation_id="$1"
   if service_logs_match "${invocation_id}" 'address already in use|bind:|cannot bind'; then
-    warn "端口绑定失败：请用 ss -lntup 检查 TCP/UDP 443 占用者；脚本不会停止其他服务。"
+    warn "端口绑定失败：请用 ss -lntup 检查所选 TCP/UDP 端口占用者；脚本不会停止其他服务。"
   elif service_logs_match "${invocation_id}" 'permission denied'; then
     warn "服务权限不足：请按日志中的路径检查 hysteria 用户读取配置、写入证书目录及绑定端口的权限。"
   elif service_logs_match "${invocation_id}" 'rate.?limited|too many (requests|certificates|failed|new)|retry[- ]after'; then
     warn "证书机构要求等待：请遵守日志中的 retry after/Retry-After 时间；重装或删除证书缓存不能解除限额。"
   elif service_logs_match "${invocation_id}" 'timeout during connect|likely firewall|connection refused'; then
-    warn "证书验证连接失败：请确认域名指向本机，并在 Google Cloud 和系统防火墙放行入站 TCP 443；同时放行客户端所需 UDP 443，确保规则目标包含此 VM。"
+    warn "证书验证连接失败：请确认域名指向本机，并在 Google Cloud 和系统防火墙放行证书所需 TCP 80（旧 TLS-ALPN 配置仍需 TCP 443）；同时放行客户端所需 UDP ${PORT}，确保规则目标包含此 VM。"
   elif service_logs_match "${invocation_id}" 'nxdomain|servfail|dns[^[:alnum:]]*(problem|error)|no valid (a|aaaa) records|no such host|name resolution|(^|[^[:alnum:]])caa([^[:alnum:]]|$)|rejectedidentifier|unauthorized'; then
     warn "域名验证失败：检查 A/AAAA 是否指向此 VM、CAA 是否允许 letsencrypt.org，关闭域名代理；更正后再运行安装。"
   elif service_logs_match "${invocation_id}" 'network is unreachable|network unreachable|no route to host'; then
@@ -855,6 +1076,27 @@ show_service_diagnostics() {
 
 }
 
+restore_renewal_timer() {
+  local status="$1"
+  if ((status != 0 && RENEW_TIMER_WAS_ACTIVE)); then
+    systemctl start "${RENEW_TIMER}" >/dev/null 2>&1 || warn "请检查原证书续期 timer：${RENEW_TIMER}。"
+  fi
+}
+
+pause_renewal_for_install() {
+  RENEW_TIMER_WAS_ACTIVE=0
+  if systemctl is-active --quiet "${RENEW_TIMER}"; then
+    RENEW_TIMER_WAS_ACTIVE=1
+  fi
+  trap 'restore_renewal_timer "$?"' EXIT
+  if ((RENEW_TIMER_WAS_ACTIVE)); then
+    systemctl stop "${RENEW_TIMER}" || die "无法暂停本协议的证书续期 timer。"
+  fi
+  if systemctl is-active --quiet "${RENEW_SERVICE}"; then
+    systemctl stop "${RENEW_SERVICE}" || die "无法暂停本协议正在执行的证书续期任务。"
+  fi
+}
+
 install_hysteria() {
   require_root
   info "安装器版本：${SCRIPT_VERSION}"
@@ -865,6 +1107,11 @@ install_hysteria() {
   require_command systemctl
   require_command journalctl
   require_command ss
+  require_command lego
+  require_command flock
+  require_command python3
+  require_command timeout
+  LEGO_BIN="$(command -v lego)"
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；请使用 Debian/Ubuntu/Rocky 等标准 VM 镜像。"
   validate_install_inputs
 
@@ -912,8 +1159,12 @@ install_hysteria() {
   if ((NO_MASQUERADE && masquerade_owned)); then
     rm -rf "${MASQUERADE_DIR}"
   fi
+  info "请放行公网 TCP 80（证书）和 UDP ${PORT}（Hysteria）。"
+  pause_renewal_for_install
+  obtain_certificate
   write_masquerade_page
   write_config
+  write_renewal_service
   write_service_policy
   systemctl daemon-reload
   systemctl enable "${SERVICE}"
@@ -927,13 +1178,15 @@ install_hysteria() {
       warn "服务启动请求失败，将继续读取日志判断是否可以修复。"
     fi
   fi
-  info "正在等待 ACME 证书签发并确认 UDP ${PORT} 监听（最长约 120 秒）..."
+  info "正在确认服务稳定运行及 UDP ${PORT} 监听（最长约 120 秒）..."
   if ! wait_for_service_with_recovery; then
     die "服务启动后未稳定运行。"
   fi
   if ! local_connection_selftest; then
     die "本机功能自测未通过，安装未完成。服务和配置已保留，修复上述问题后可重试。"
   fi
+  systemctl enable --now "${RENEW_TIMER}" || warn "证书续期 timer 未启动，请检查 ${RENEW_TIMER}。"
+  trap - EXIT
   print_connection_info
 }
 
@@ -948,6 +1201,7 @@ update_hysteria() {
   require_command journalctl
   [[ -d /run/systemd/system ]] || die "此系统没有运行 systemd；无法更新 systemd 服务。"
   check_service_policy_path
+  load_installed_ports
   local service_active=0
   systemctl is-active --quiet "${SERVICE}" 2>/dev/null && service_active=1 || true
   backup_config
@@ -1000,10 +1254,14 @@ uninstall_hysteria() {
     return 1
   fi
   systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || warn "无法禁用服务，请检查残留的开机启动链接。"
+  systemctl disable --now "${RENEW_TIMER}" >/dev/null 2>&1 || true
+  systemctl stop "${RENEW_SERVICE}" >/dev/null 2>&1 || true
   if ! bash "${temp_file}" --remove; then
     rm -f "${temp_file}"
     return 1
   fi
+  rm -f "/etc/systemd/system/${RENEW_SERVICE}" "/etc/systemd/system/${RENEW_TIMER}" "${RENEW_SCRIPT}"
+  rm -f "${CERT_FILE}" "${KEY_FILE}"
   remove_service_policy
   systemctl daemon-reload
   rm -f "${CONFIG_FILE}"

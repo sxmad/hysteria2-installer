@@ -10,11 +10,15 @@ permissions:
 jobs:
   installer:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl python3 curl iproute2
       - name: Syntax and startup regressions
         run: |
           for script in install.sh test_startup.sh test_proxy.sh test_service_systemd.sh; do
@@ -23,6 +27,16 @@ jobs:
           bash install.sh --help
           bash test_startup.sh
       - name: Recovery policy and lifecycle regressions
-        run: python3 test_service_policy.py
+        run: |
+          python3 test_service_policy.py
+          python3 test_coexist.py
+      - name: Real Hysteria TLS authentication and forwarding
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 --retry 2 --max-time 120 \
+            https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/hysteria-linux-amd64 \
+            -o "$RUNNER_TEMP/hysteria"
+          printf '%s  %s\n' 907ba8c9693edb104b20582681fb7dc15639d5b64a9cbb616a7b539190a86691 "$RUNNER_TEMP/hysteria" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/hysteria"
+          HYSTERIA_TEST_BINARY="$RUNNER_TEMP/hysteria" bash test_proxy.sh
       - name: Real systemd failure recovery and manual stop
         run: sudo env HYSTERIA_TEST_SYSTEMD=1 bash test_service_systemd.sh
