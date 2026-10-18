@@ -12,6 +12,14 @@ TEST_UNIT_FILE="/run/systemd/system/${TEST_UNIT}"
 TEST_DROPIN_DIR="${TEST_UNIT_FILE}.d"
 [[ ! -e "${TEST_UNIT_FILE}" && ! -e "${TEST_DROPIN_DIR}" ]] || exit 1
 cleanup() {
+  local test_status=$?
+  if ((test_status)); then
+    systemctl show "${TEST_UNIT}" \
+      -p ActiveState -p SubState -p Result -p NRestarts \
+      -p Restart -p RestartUSec -p StartLimitIntervalUSec -p StartLimitBurst \
+      -p FragmentPath -p DropInPaths --no-pager || true
+    journalctl -u "${TEST_UNIT}" --no-pager -n 40 || true
+  fi
   systemctl stop "${TEST_UNIT}" >/dev/null 2>&1 || true
   systemctl reset-failed "${TEST_UNIT}" >/dev/null 2>&1 || true
   rm -f -- "${TEST_UNIT_FILE}" "${TEST_DROPIN_DIR}/20-hysteria2-installer.conf"
@@ -39,6 +47,9 @@ Type=simple
 ExecStart=/bin/sh -c 'exit 42'
 EOF
 systemctl daemon-reload
+systemctl show "${TEST_UNIT}" \
+  -p Restart -p RestartUSec -p StartLimitIntervalUSec -p StartLimitBurst \
+  -p FragmentPath -p DropInPaths --no-pager
 systemctl start "${TEST_UNIT}"
 for ((attempt=0; attempt<45; attempt++)); do
   [[ "$(systemctl show "${TEST_UNIT}" -p Result --value)" == start-limit-hit ]] && break
