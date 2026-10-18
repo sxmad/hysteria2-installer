@@ -5,7 +5,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="hysteria2-installer"
-readonly SCRIPT_VERSION="2026-10-18.2"
+readonly SCRIPT_VERSION="2026-10-18.3"
 readonly OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
 readonly CONFIG_DIR="/etc/hysteria"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
@@ -32,6 +32,7 @@ readonly DEFAULT_PAGE_TEXT="asdfq"
 ACTION="install"
 DOMAIN=""
 EMAIL=""
+ACME_WEBROOT=""
 PORT="${DEFAULT_PORT}"
 PASSWORD=""
 PASSWORD_FROM_STDIN=0
@@ -73,6 +74,7 @@ Usage:
 Install options:
   --domain DOMAIN       Certificate domain (no default; prompt if omitted)
   --email EMAIL         ACME email (no default; prompt if omitted)
+  --acme-webroot DIR    Use an existing HTTP website for issuance and renewal
   --port PORT           Hysteria UDP port (1-65535; default: 443)
   --https-port PORT      Optional TCP HTTPS page (default: disabled)
                         Certificate issuance/renewal always uses TCP 80
@@ -171,6 +173,11 @@ parse_args() {
         EMAIL="$2"
         shift
         ;;
+      --acme-webroot)
+        (($# >= 2)) && [[ -n "$2" ]] || die "--acme-webroot 需要非空目录。"
+        ACME_WEBROOT="$2"
+        shift
+        ;;
       --port)
         (($# >= 2)) || die "--port 需要参数。"
         PORT="$2"
@@ -231,6 +238,7 @@ collect_install_identity() {
 }
 
 validate_install_inputs() {
+  validate_acme_webroot
   [[ -n "${DOMAIN}" ]] || die "域名不能为空。"
   [[ -n "${EMAIL}" ]] || die "邮箱不能为空。"
 
@@ -487,6 +495,42 @@ cert_valid() {
   [[ -n "${cert_pub}" && "${cert_pub}" == "${key_pub}" ]]
 }
 
+validate_acme_webroot() {
+  [[ -n "${ACME_WEBROOT}" ]] || return 0
+  [[ "${ACME_WEBROOT}" == /* && -d "${ACME_WEBROOT}" && "${ACME_WEBROOT}" != *$'\n'* && "${ACME_WEBROOT}" != *$'\r'* ]] ||
+    die "--acme-webroot 必须是已存在的网站根目录绝对路径。"
+}
+
+check_http_challenge() {
+  if [[ -n "${ACME_WEBROOT}" ]]; then
+    validate_acme_webroot
+  elif port_in_use 80; then
+    warn "请执行 sudo ss -ltnp 'sport = :80' 确认占用进程。"
+    die "TCP 80 已被占用；如为现有网站，请配置该域名的 HTTP 验证路径并使用 --acme-webroot DIR。安装器不会停止旧服务；更换代理端口不能解决证书端口冲突。"
+  fi
+}
+
+preflight_certificate() {
+  (
+    exec 9>"${ACME_LOCK}"
+    flock -w 300 9 || die "等待另一协议的证书操作超时，请稍后重试。"
+    if ! cert_valid; then check_http_challenge; fi
+  )
+}
+
+run_lego() (
+  local -a webroot_args=()
+  if [[ -n "${ACME_WEBROOT}" ]]; then
+    validate_acme_webroot
+    # Only public challenge files use 022. The ACME cache parent stays 0700.
+    # Do not chmod existing website directories or stop/reload its service.
+    umask 022
+    mkdir -p -- "${ACME_WEBROOT}/.well-known/acme-challenge" || exit 1
+    webroot_args=(--http.webroot "${ACME_WEBROOT}")
+  fi
+  timeout 180s "${LEGO_BIN}" "${webroot_args[@]}" "$@"
+)
+
 obtain_certificate() {
   if ! cert_valid; then CERT_CREATED=1; fi
   (
@@ -503,9 +547,7 @@ obtain_certificate_locked() {
     sync_certificate
     return 0
   fi
-  if port_in_use 80; then
-    die "TCP 80 已被其他进程占用；HTTP-01 需要此端口，安装器不会停止该进程。"
-  fi
+  check_http_challenge
   CERT_CREATED=1
   local attempt=0 log="$(mktemp)" status=0 acme_action=run
   if [[ -s "${LEGO_DIR}/certificates/${DOMAIN}.crt" && -s "${LEGO_DIR}/certificates/${DOMAIN}.key" ]]; then
@@ -520,9 +562,9 @@ obtain_certificate_locked() {
     fi
     status=0
     if [[ "${acme_action}" == renew ]]; then
-      timeout 180s "${LEGO_BIN}" --path "${LEGO_DIR}" --domains "${DOMAIN}" --http renew --days 30 >"${log}" 2>&1 || status=$?
+      run_lego --path "${LEGO_DIR}" --domains "${DOMAIN}" --http renew --days 30 >"${log}" 2>&1 || status=$?
     else
-      timeout 180s "${LEGO_BIN}" --accept-tos --path "${LEGO_DIR}" --email "${EMAIL}" \
+      run_lego --accept-tos --path "${LEGO_DIR}" --email "${EMAIL}" \
         --domains "${DOMAIN}" --http run >"${log}" 2>&1 || status=$?
     fi
     if ((status == 0)) && cert_valid; then
@@ -541,6 +583,10 @@ obtain_certificate_locked() {
       warn "HTTP-01 验证连接超时或被拒绝；请核对 ${DOMAIN} 的解析与 VM 公网 IP。"
       warn "确认公网入站 TCP 80 已放行，GCP 规则匹配该 VM 的 VPC/网络标记，主机防火墙也允许；--port ${PORT} 不改变证书验证端口。"
       die "请修复 TCP 80 可达性后重新运行安装命令，避免连续申请失败；未生成连接信息。"
+    fi
+    if [[ -n "${ACME_WEBROOT}" ]] && grep -Eiq 'unauthorized|Invalid response|404|403' "${log}"; then
+      rm -f "${log}"
+      die "网站未正确提供 http://${DOMAIN}/.well-known/acme-challenge/ 下的验证文件；请检查 --acme-webroot 对应目录、虚拟主机、重定向和访问权限后重试。"
     fi
     if ((attempt >= 3)); then
       rm -f "${log}"
@@ -562,7 +608,7 @@ render_renewal_script() {
   printf '%s=%q\n' domain "${DOMAIN}" lego_dir "${LEGO_DIR}" \
     cert_file "${CERT_FILE}" key_file "${KEY_FILE}" lego_bin "${LEGO_BIN}" \
     pending_file "${STATE_DIR}/certificate-reload.pending" \
-    lock_file "${ACME_LOCK}"
+    lock_file "${ACME_LOCK}" acme_webroot "${ACME_WEBROOT}"
   # Only the header is expanded here. Runtime variables must remain literal.
   cat <<'EOF'
 exec 9>"${lock_file}"
@@ -581,7 +627,16 @@ valid_pair() {
 if ! valid_pair 2592000; then
   # HTTP-01 always uses TCP 80, independent of the Hysteria UDP port.
   # Never stop either proxy to renew a certificate.
-  timeout 180s "${lego_bin}" --path "${lego_dir}" --domains "${domain}" --http renew --days 30
+  http_args=(--http)
+  (
+    if [[ -n "${acme_webroot}" ]]; then
+      [[ -d "${acme_webroot}" ]] || { echo 'ACME webroot missing; keeping deployed certificate' >&2; exit 1; }
+      umask 022
+      mkdir -p -- "${acme_webroot}/.well-known/acme-challenge"
+      http_args+=(--http.webroot "${acme_webroot}")
+    fi
+    timeout 180s "${lego_bin}" --path "${lego_dir}" --domains "${domain}" "${http_args[@]}" renew --days 30
+  )
 fi
 valid_pair 0 || { echo 'hysteria-cert-renew: invalid certificate/key; keeping deployed files' >&2; exit 1; }
 if cmp -s "${cert}" "${cert_file}" && cmp -s "${key}" "${key_file}" && [[ ! -e "${pending_file}" ]]; then
@@ -1127,6 +1182,7 @@ install_hysteria() {
   quarantine_connection_artifacts
   check_domain_resolution
   check_port_available
+  preflight_certificate
   check_service_policy_path
 
   backup_config

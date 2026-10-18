@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-修订号 **2026-10-18.2**：支持自定义 **UDP** 端口，可按任意顺序与 Trojan 共存。Hysteria 代理外层是 UDP/QUIC；转发 TCP 网站流量时，外层也不会改成 TCP。普通 HTTPS 页面使用独立的 TCP 监听。
+修订号 **2026-10-18.3**：支持自定义 **UDP** 端口，可按任意顺序与 Trojan 共存。Hysteria 代理外层是 UDP/QUIC；转发 TCP 网站流量时，外层也不会改成 TCP。普通 HTTPS 页面使用独立的 TCP 监听。
 
 ## 一键安装
 
@@ -141,3 +141,13 @@ sudo env HYSTERIA_TEST_SYSTEMD=1 bash test_service_systemd.sh
 ```
 
 覆盖启动、TCP/UDP 分离、自定义配置与更新、HTTP-01 锁、真实证书下续期和失败恢复、TLS/认证/转发及 systemd 恢复。统一仓库另有真实 Trojan/HY2 两种启动顺序共存测试。这些不能替代公网 ACME/GCP/Shadowrocket 验证或多天运行观察。
+
+## TCP 80 已有网站时
+
+旧 Trojan 部署可能带有 Nginx/Apache，长期占用 TCP 80。修改代理的 TCP/UDP 端口不能解决这个证书冲突。先运行 `sudo ss -ltnp 'sport = :80'` 确认进程。
+
+配置现有网站，让 `http://你的域名/.well-known/acme-challenge/TOKEN` 对应 `/实际网站目录/.well-known/acme-challenge/TOKEN`，然后在安装命令中增加 `--acme-webroot /实际网站目录`。目录必须存在且为绝对路径；脚本不会猜测 `/var/www/html`、修改网站配置或停止网站。公网 TCP 80 仍须放行。已有站点可能重定向或拒绝新域名，不能仅凭目录存在就认定可用。
+
+签发和以后自动续期都会使用此目录，不能安装后删除验证路径。仅新建的公开验证文件使用可读权限，不修改已有网站目录权限；ACME 账号和私钥仍保存在私有目录。`update` 不会改证书模式；更改模式需重新安装，要保留客户端配置时必须传入原密码。
+
+参考[已有网站与失败重试说明](https://github.com/sxmad/mofatizi-installer/blob/main/README.zh-CN.md#tcp-80-已有网站时)。不要只临时停止 Web 服务完成安装，否则以后自动续期仍会遇到端口冲突。

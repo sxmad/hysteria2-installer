@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Hysteria 2 installer for Google Cloud VMs and Shadowrocket. Revision **2026-10-18.2** supports custom **UDP** ports and coexistence with Trojan in either installation order.
+Hysteria 2 installer for Google Cloud VMs and Shadowrocket. Revision **2026-10-18.3** supports custom **UDP** ports and coexistence with Trojan in either installation order.
 
 Hysteria proxy transport is QUIC over UDP. Forwarding a TCP website connection through Hysteria does not change the outer transport to TCP. Optional ordinary HTTPS masquerading is a separate TCP listener.
 
@@ -163,3 +163,19 @@ sudo env HYSTERIA_TEST_SYSTEMD=1 bash test_service_systemd.sh
 Tests cover startup, port separation, custom config/update, HTTP-01 locking, real certificate fixtures, renewal failures/retries, actual TLS/authentication/forwarding, and systemd recovery. The unified repository additionally tests real Trojan/Hysteria coexistence in both start orders. They do not replace public ACME/GCP/Shadowrocket deployment checks or a multi-day soak test.
 
 References: [Hysteria configuration](https://v2.hysteria.network/docs/advanced/Full-Server-Config/) · [HTTP-01](https://letsencrypt.org/docs/challenge-types/#http-01-challenge)
+
+## Existing website on TCP 80
+
+Older Trojan stacks may run Nginx/Apache on TCP 80. A different **proxy** port does not resolve this certificate challenge conflict. First identify the listener:
+
+```bash
+sudo ss -ltnp 'sport = :80'
+```
+
+Add `--acme-webroot /actual/website/root` to the install command only after the existing HTTP server serves `http://YOUR_DOMAIN/.well-known/acme-challenge/TOKEN` from `/actual/website/root/.well-known/acme-challenge/TOKEN`. The path must be an existing absolute directory; the installer does not guess `/var/www/html`, reconfigure a web server, or stop it. Public TCP 80 is still required. An existing virtual host can redirect or reject a new hostname, so an existing directory alone is insufficient.
+
+This mode is saved in the generated renewal script. Keep that directory, HTTP route and permissions working for future renewal. Only new public challenge files/directories use readable permissions; existing website permissions are not changed. ACME account/private key storage remains private. `update` does not retrofit certificate options; a configured reinstall is needed to change the certificate mode, with the original password if keeping clients unchanged.
+
+See the [existing HTTP server and recovery guide](https://github.com/sxmad/mofatizi-installer#existing-http-server-on-port-80) for an Nginx example and recovery after an incomplete install. Do not temporarily stop a web server merely to pass installation: unattended renewal would hit the same conflict later.
+
+Additional regression test: `python3 test_webroot.py`. It exercises issuance and renewal argument/permission handling through a real local HTTP server with a simulated CA client; public ACME still requires a deployment check.

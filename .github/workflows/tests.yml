@@ -30,6 +30,7 @@ jobs:
         run: |
           python3 test_service_policy.py
           python3 test_coexist.py
+          python3 test_webroot.py
       - name: Real Hysteria TLS authentication and forwarding
         run: |
           curl -fL --proto '=https' --tlsv1.2 --retry 2 --max-time 120 \
